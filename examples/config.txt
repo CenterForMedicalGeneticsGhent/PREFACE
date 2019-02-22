@@ -1,4 +1,4 @@
-ID	filepath	gender	FFY
+ID	filepath	gender	FF
 ID_0	/path/to/ID_0.bed	M	10.470662487285
 ID_1	/path/to/ID_1.bed	F	0.0
 ID_2	/path/to/ID_2.bed	M	6.5079177218136

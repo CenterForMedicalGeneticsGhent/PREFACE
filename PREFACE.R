@@ -1,4 +1,4 @@
-version = 'v0.0.2'
+version = 'v0.1.0'
 
 # ---
 # Functions
@@ -7,7 +7,7 @@ version = 'v0.0.2'
 print.help <- function(w = 'all'){
   cat('\nUsage:\n')
   if (w == 'all' | w == 'train'){
-    cat('\tRScript PREFACE.R train --config path/to/config.txt --outdir path/to/dir/ [--nfeat (int) --hidden (int) --cpus (int) --olm --noskewcorrect]\n')
+    cat('\tRScript PREFACE.R train --config path/to/config.txt --outdir path/to/dir/ [--nfeat (int) --hidden (int) --cpus (int) --femprop --olm --noskewcorrect]\n')
   }
   if (w == 'all' | w == 'predict'){
     cat('\tRScript PREFACE.R predict --infile path/to/infile.bed --model path/to/model.RData [–-json]\n')
@@ -155,13 +155,14 @@ train <- function(args){
   args = args[args != out.dir]
   
   ## Optional
-  op.args <- c('--nfeat', '--hidden', '--olm', '--noskewcorrect', '--cpus')
+  op.args <- c('--nfeat', '--hidden', '--olm', '--femprop',  '--noskewcorrect', '--cpus')
   
   n.feat <- parse.op.arg(args, '--nfeat', 50)[[1]] ; args <- parse.op.arg(args, '--nfeat', 50)[[2]]
   hidden <- parse.op.arg(args, '--hidden', 2)[[1]] ; args <- parse.op.arg(args, '--hidden', 2)[[2]]
   cpus <- parse.op.arg(args, '--cpus', 1)[[1]] ; args <- parse.op.arg(args, '--cpus', 1)[[2]]
   is.olm = F ; if ('--olm' %in% args) is.olm = T
   skewcorrect = T ; if ('--noskewcorrect' %in% args) skewcorrect = F
+  train.gender = c('M') ; if ('--femprop' %in% args) train.gender = c('M', 'F')
   
   ## Others
   
@@ -177,8 +178,8 @@ train <- function(args){
   
   config.file <- read.csv(file = config.file, sep = '\t', header = T,
                           comment.char='', colClasses = c('character', 'character', 'factor', 'numeric'))
-  if (length(which(config.file$gender == 'M')) < n.feat){
-    cat(paste0('Please provide at least ', n.feat, ' male samples.\n'))
+  if (length(which(config.file$gender %in% train.gender)) < n.feat){
+    cat(paste0('Please provide at least ', n.feat, ' labeled samples.\n'))
     quit(save = 'no')
   }
   
@@ -224,22 +225,23 @@ train <- function(args){
   
   repeats = 10
   test.percentage = 1/repeats
-  male.test.number = length(which(config.file$gender == 'M')) * test.percentage
+  
+  test.number = length(which(config.file$gender %in% train.gender)) * test.percentage
   
   oper <- foreach(i = 1:repeats) %dopar% {
 
     cat(paste0('Model training | Repeat ', i,'/', repeats, ' ...\n'))
     
-    male.test.index.overall <- which(config.file$gender == 'M')[(as.integer((i-1)*male.test.number) + 1):as.integer(i*male.test.number)]
-    male.train.index.overall <- sort(which(config.file$gender == 'M')[!((which(config.file$gender == 'M')) %in% male.test.index.overall)])
-    male.train.index.subset <- sort(which(config.file$gender[-male.test.index.overall] == 'M'))
+    test.index.overall <- which(config.file$gender %in% train.gender)[(as.integer((i-1)*test.number) + 1):as.integer(i*test.number)]
+    train.index.overall <- sort(which(config.file$gender %in% train.gender)[!((which(config.file$gender %in% train.gender)) %in% test.index.overall)])
+    train.index.subset <- sort(which(config.file$gender[-test.index.overall] %in% train.gender))
     
     cat(paste0('\tExecuting principal component analysis ...\n'))
-    pca.train <- prcomp(training.frame[-male.test.index.overall,])
-    X.train <- as.matrix(pca.train$x[male.train.index.subset, ])
-    Y.train <- as.matrix(config.file$FFY[male.train.index.overall], ncol = 1)
-    X.test <- as.matrix(scale(training.frame[male.test.index.overall,], pca.train$center, pca.train$scale) %*% pca.train$rotation)
-    Y.test <- as.matrix(config.file$FFY[male.test.index.overall], ncol = 1)
+    pca.train <- prcomp(training.frame[-test.index.overall,])
+    X.train <- as.matrix(pca.train$x[train.index.subset, ])
+    Y.train <- as.matrix(config.file$FF[train.index.overall], ncol = 1)
+    X.test <- as.matrix(scale(training.frame[test.index.overall,], pca.train$center, pca.train$scale) %*% pca.train$rotation)
+    Y.test <- as.matrix(config.file$FF[test.index.overall], ncol = 1)
     
     if (is.olm){
       cat(paste0('\tTraining ordinary linear model ...\n'))
@@ -257,7 +259,7 @@ train <- function(args){
       prediction = as.numeric(compute(model, X.test[,1:n.feat])$net.result)
     }
     
-    info <- plot.performance(prediction, Y.test, summary(pca.train), n.feat, 'PREFACE (%)', 'FFY (%)', paste0(out.dir, 'training_repeats/', 'repeat_', i,'.png'))
+    info <- plot.performance(prediction, Y.test, summary(pca.train), n.feat, 'PREFACE (%)', 'FF (%)', paste0(out.dir, 'training_repeats/', 'repeat_', i,'.png'))
     
     results <- list()
     results$intercept <- as.numeric(info[1])
@@ -274,7 +276,7 @@ train <- function(args){
   
   if (skewcorrect){
     p <- sample(length(predictions))[1:(length(predictions)/4)]
-    fit <- coef(lsfit(predictions[p], config.file$FFY[config.file$gender == 'M'][p]))
+    fit <- coef(lsfit(predictions[p], config.file$FF[config.file$gender %in% train.gender][p]))
     the.intercept <- fit[1]
     the.slope <- fit[2]
   } else {
@@ -287,9 +289,9 @@ train <- function(args){
   png(paste0(out.dir, 'FFX.png'), width=5, height=2.8, units='in', res=1024)
   par(mar=c(2.7,2,0,0.3), mgp=c(1.5, 0.2, 0.2), mfrow=c(1,2), xpd = NA, oma=c(0,1.5,0,0))
   
-  v1 <- config.file$FFY[config.file$gender == 'M']
+  v1 <- config.file$FF[config.file$gender == 'M']
   v2 <- X.ratios[config.file$gender == 'M']
-  plot(v1, v2, pch = 16, cex = 0.4, axes = F, xlab = 'FFY (%)', ylab = 'μ(ratio X)',
+  plot(v1, v2, pch = 16, cex = 0.4, axes = F, xlab = 'FF (%)', ylab = 'μ(ratio X)',
        xlim = c(0, max(v1)))
   fit <- rlm(v2 ~ v1)
   
@@ -316,7 +318,7 @@ train <- function(args){
   
   
   v2 <- (v2 - fit[1]) / fit[2]
-  plot(v1, v2, pch = 16, cex = 0.4, axes = F, xlab = 'FFY (%)', ylab = 'FFX (%)',
+  plot(v1, v2, pch = 16, cex = 0.4, axes = F, xlab = 'FF (%)', ylab = 'FFX (%)',
        xlim = c(0, max(v1)))
   segments(min(v1), min(v1), max(v1), max(v1), lwd = 3, lty = 3, c = color.B)
   
@@ -335,8 +337,8 @@ train <- function(args){
   
   cat(paste0('Executing final principal component analysis ...\n'))
   pca.train <- prcomp(training.frame)
-  X.train <- as.matrix(pca.train$x[which(config.file$gender == 'M'), ])
-  Y.train <- as.matrix(config.file$FFY[which(config.file$gender == 'M')], ncol = 1)
+  X.train <- as.matrix(pca.train$x[which(config.file$gender %in% train.gender), ])
+  Y.train <- as.matrix(config.file$FF[which(config.file$gender %in% train.gender)], ncol = 1)
   
   if (is.olm){
     cat(paste0('Training final ordinary linear model ...\n'))
@@ -352,28 +354,28 @@ train <- function(args){
     model <- train.neural(f, train.nn, hidden)
   }
   
-  m.config.file <- config.file[config.file$gender == 'M', ]
+  train.config.file <- config.file[config.file$gender %in% train.gender, ]
   
-  info <- plot.performance(predictions, m.config.file$FFY, summary(pca.train),
-                           n.feat, 'PREFACE (%)', 'FFY (%)', paste0(out.dir, 'overall_performance.png'))
+  info <- plot.performance(predictions, train.config.file$FF, summary(pca.train),
+                           n.feat, 'PREFACE (%)', 'FF (%)', paste0(out.dir, 'overall_performance.png'))
   
-  index.10 <- which(m.config.file$FFY < 20 - predictions)
-  deviations.10 <- abs(predictions[index.10] - m.config.file$FFY[index.10])
+  index.10 <- which(train.config.file$FF < 20 - predictions)
+  deviations.10 <- abs(predictions[index.10] - train.config.file$FF[index.10])
   
-  deviations <- abs(predictions - m.config.file$FFY)
+  deviations <- abs(predictions - train.config.file$FF)
   outliers.index <- which(deviations > info[4] + 3 * info[5])
-  outliers <- m.config.file$ID[outliers.index]
+  outliers <- train.config.file$ID[outliers.index]
   outlier.values <- deviations[outliers.index]
-  outliers.values.noabs <- c(predictions - m.config.file$FFY)[outliers.index]
+  outliers.values.noabs <- c(predictions - train.config.file$FF)[outliers.index]
   
   sink(paste0(out.dir, 'training_statistics.txt'))
   cat('PREFACE - PREdict FetAl ComponEnt\n\n')
   if (length(outliers) != 0){
     cat(paste0('Below, some of the top candidates for outlier removal are listed.\n',
-      'If you know some of these have Y-aberrations, remove them from the config file and re-run.\n',
-      'Do not remove cases without being certain sex aneuploidies are present. If you do so, this will result in inaccurate performance statistics and possible overfitting towards unrelevant models.\n\n'))
+      'If you know some of these are low quality/have sex aberrations (when using FFY), remove them from the config file and re-run.\n',
+      'Avoid removing other cases, as this will result in inaccurate performance statistics and possible overfitting towards unrelevant models.\n\n'))
     cat('_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_\n')
-    cat('ID\tFFY (%) - PREFACE (%)\n')
+    cat('ID\tFF (%) - PREFACE (%)\n')
     for (i in rev(order(outlier.values))){
       cat(paste0(outliers[i], '\t', outliers.values.noabs[i], '\n'))
     }
