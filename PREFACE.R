@@ -1,4 +1,4 @@
-version = 'v0.0.1'
+version = 'v0.0.2'
 
 # ---
 # Functions
@@ -7,10 +7,10 @@ version = 'v0.0.1'
 print.help <- function(w = 'all'){
   cat('\nUsage:\n')
   if (w == 'all' | w == 'train'){
-    cat('\tRScript PREFACE.R train --config path/to/config.txt --outdir path/to/dir/ [--nfeat (int) --cpus (int) --olm --noskewcorrect]\n')
+    cat('\tRScript PREFACE.R train --config path/to/config.txt --outdir path/to/dir/ [--nfeat (int) --hidden (int) --cpus (int) --olm --noskewcorrect]\n')
   }
   if (w == 'all' | w == 'predict'){
-    cat('\tRScript PREFACE.R predict --infile path/to/infile.bed --model path/to/model.RData\n')
+    cat('\tRScript PREFACE.R predict --infile path/to/infile.bed --model path/to/model.RData [–-json]\n')
   }
   cat('\n')
   quit(save = 'no')
@@ -19,6 +19,21 @@ print.help <- function(w = 'all'){
 unrec.args <- function(w = 'all'){
   cat('\nUnrecongized arguments, have you read the manual at \'https://github.com/CenterForMedicalGeneticsGhent/PREFACE\'?')
   print.help(w)
+}
+
+parse.op.arg <- function(args, sub.arg, default){
+  if (sub.arg %in% args){
+    i = which(args == sub.arg) + 1
+    resp = as.integer(args[i])
+    args = args[-i]
+  } else {
+    resp = default
+  }
+  if (is.na(resp)){
+    cat(paste0('Argument \'', sub.arg, '\' requires a value.\n'))
+    print.help()
+  }
+  return(list(resp, args))
 }
 
 get.m.diff <- function(v1, v2, abs = T){
@@ -95,6 +110,15 @@ plot.performance <- function(v1, v2, summary, n.feat, xlab, ylab, path){
   return(c(fit[1], fit[2], get.m.diff(v1, v2), get.sd.diff(v1, v2), cor(v1, v2)))
 }
 
+train.neural <- function(f, train.nn, hidden){
+  tryCatch({
+    return(neuralnet(f, train.nn, hidden = hidden, stepmax = 1e6))
+  }, warning = function(e) {
+    cat(paste0('Neural network did not converge. Re-run and decrease --hidden or --nfeat. Alternatively, use --olm.\n'))
+    quit(save = 'no')
+  })
+}
+
 # ---
 # Modules
 # ---
@@ -131,27 +155,17 @@ train <- function(args){
   args = args[args != out.dir]
   
   ## Optional
-  op.args <- c('--nfeat', '--olm', '--noskewcorrect', '--cpus')
-  if ('--nfeat' %in% args){
-    n.feat = as.integer(args[which(args == '--nfeat') + 1])
-    args = args[args != n.feat]
-  } else {
-    n.feat = 50
-  }
-  if ('--cpus' %in% args){
-    cpus = as.integer(args[which(args == '--cpus') + 1])
-    args = args[args != cpus]
-  } else {
-    cpus = 1
-  }
-  is.olm = F
-  if ('--olm' %in% args) is.olm = T
-  skewcorrect = T
-  if ('--noskewcorrect' %in% args) skewcorrect = F
-
+  op.args <- c('--nfeat', '--hidden', '--olm', '--noskewcorrect', '--cpus')
+  
+  n.feat <- parse.op.arg(args, '--nfeat', 50)[[1]] ; args <- parse.op.arg(args, '--nfeat', 50)[[2]]
+  hidden <- parse.op.arg(args, '--hidden', 2)[[1]] ; args <- parse.op.arg(args, '--hidden', 2)[[2]]
+  cpus <- parse.op.arg(args, '--cpus', 1)[[1]] ; args <- parse.op.arg(args, '--cpus', 1)[[2]]
+  is.olm = F ; if ('--olm' %in% args) is.olm = T
+  skewcorrect = T ; if ('--noskewcorrect' %in% args) skewcorrect = F
+  
   ## Others
   
-  if(any(!(args %in% c(man.args, op.args, out.dir, config.file)))){
+  if(any(!(args %in% c(man.args, op.args)))){
     cat(paste0('Argument(s) \'', paste0(args[!(args %in% c(man.args, op.args))], collapse = '\', \''), '\' not recognized. Will ignore.\n'))
   }
   
@@ -239,7 +253,7 @@ train <- function(args){
       f <- paste('FF ~',f)
       f <- as.formula(f)
       cat(paste0('\tTraining neural network ...\n'))
-      model <- neuralnet(f, train.nn, hidden = 2, threshold = 0.01, stepmax = 1e6)
+      model <- train.neural(f, train.nn, hidden)
       prediction = as.numeric(compute(model, X.test[,1:n.feat])$net.result)
     }
     
@@ -252,7 +266,7 @@ train <- function(args){
     return(results)
   }
   stopImplicitCluster()
-  
+
   predictions <- c()
   for(rep in 1:repeats){
     predictions <- c(predictions, oper[[rep]]$prediction)
@@ -335,7 +349,7 @@ train <- function(args){
     f <- paste('FF ~',f)
     f <- as.formula(f)
     cat(paste0('Training final neural network ...\n'))
-    model <- neuralnet(f, train.nn, hidden = 2, threshold = 0.01, stepmax = 1e6)
+    model <- train.neural(f, train.nn, hidden)
   }
   
   m.config.file <- config.file[config.file$gender == 'M', ]
@@ -501,5 +515,3 @@ if (!(args[1] %in% c('train', 'predict'))){
 if (args[1] == 'train') train(args[-1])
 
 if (args[1] == 'predict') predict(args[-1])
-
-quit(save = 'no')
