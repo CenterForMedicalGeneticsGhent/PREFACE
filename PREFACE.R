@@ -58,8 +58,8 @@ plot.performance <- function(v1, v2, summary, n.feat, xlab, ylab, path){
   plot(log(1:ncol(summary$importance)), log(summary$importance[2,]), ylim = log(ylim), xlim = log(xlim), type = 'l', lwd = 2,
        axes = F, ylab = 'Proportion of variance', xlab = 'Principal components', col = color.A, main = 'PCA')
   
-  segments(log(50), log(ylim[1]), log(50), log(ylim[2] * .99), lwd = 3, lty = 3, c = color.C)
-  text(log(50), log(ylim[2]), 'Number of features', col = color.C, adj = 0.5, cex = 0.8)
+  segments(log(n.feat), log(ylim[1]), log(n.feat), log(ylim[2] * .99), lwd = 3, lty = 3, c = color.C)
+  text(log(n.feat), log(ylim[2]), 'Number of features', col = color.C, adj = 0.5, cex = 0.8)
   
   label.seq = round(seq(from = xlim[1], to = xlim[2], (xlim[2] - xlim[1])/xlim[2]))
   axis(1, tcl=0.5, at = log(label.seq), labels = label.seq)
