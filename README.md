@@ -85,7 +85,7 @@ Other versions are of course expected to work equally well. To install within R 
 install.packages(c('data.table', 'glmnet', 'neuralnet', 'foreach', 'doParallel', 'MASS'))
 ```
 
-Edit (*): Package neuralnet currently requires specifically v1.33. To install within R use devtools library and  
+(*) Edit: PREFACE currently requires neuralnet to be v1.33. To install within R use the devtools library with  
 
 ```bash
 
