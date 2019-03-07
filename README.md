@@ -89,5 +89,5 @@ install.packages(c('data.table', 'glmnet', 'neuralnet', 'foreach', 'doParallel',
 
 ```bash
 
-install_version("neuralnet", version = "1.33", repos = "http://cran.us.r-project.org”)
+install_version('neuralnet', version = '1.33', repos = 'http://cran.us.r-project.org')
 ```
