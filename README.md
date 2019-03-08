@@ -72,7 +72,7 @@ RScript PREFACE.R predict --infile path/to/infile.bed --model path/to/model.RDat
 
 - doParallel (v1.0.14)  
 - foreach (v1.4.4)  
-- neuralnet (v1.33) (*)  
+- neuralnet (v1.44.2)  
 - glmnet (v2.0-16)  
 - data.table (v1.11.8)  
 - MASS (v7.3-49)  
@@ -83,11 +83,4 @@ Other versions are of course expected to work equally well. To install within R 
 ```bash
 
 install.packages(c('data.table', 'glmnet', 'neuralnet', 'foreach', 'doParallel', 'MASS'))
-```
-
-(*) Edit: PREFACE currently requires neuralnet to be v1.33. To install within R use the devtools library with  
-
-```bash
-
-install_version('neuralnet', version = '1.33', repos = 'http://cran.us.r-project.org')
 ```

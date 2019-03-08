@@ -400,7 +400,7 @@ train <- function(args){
   if(is.olm){
     model <- model[which(names(model) %in% c('beta', 'lambda', 'a0', 'offset'))]
   } else {
-    model <- model[which(names(model) %in% c('linear.output', 'weights'))]
+    model <- model[which(names(model) %in% c('linear.output', 'weights', 'model.list'))]
   }
 
   save('n.feat', 'mean.features', 'possible.features', 'pca.center',
