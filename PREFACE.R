@@ -194,7 +194,7 @@ train <- function(args){
     sample <- config.file$ID[i]
     cat(paste0('Loading sample ', sample, ' | ', nrow(config.file) - i, '/', nrow(config.file), ' remaining ...\n'))
     bin.table <- fread(config.file$filepath[i], header = T, sep = '\t')
-    return(as.numeric(bin.table$ratio))
+    return(as.numeric(bin.table$ratio[bin.table$chr != 'Y']))
   }
 
   colnames(training.frame.sub) <- config.file$ID
