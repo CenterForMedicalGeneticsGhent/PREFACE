@@ -1,4 +1,4 @@
-version = 'v0.1.0'
+version = 'v0.1.1'
 
 # ---
 # Functions
@@ -89,7 +89,7 @@ plot.performance <- function(v1, v2, summary, n.feat, xlab, ylab, path){
   par(xpd=NA)
   
   text(0, mx * 1.03,
-       paste0('(ρ = ', signif(cor(v1, v2), 3), ')'),
+       paste0('(r = ', signif(cor(v1, v2), 3), ')'),
        cex = 0.9, adj = 0)
   t = hist(v1-v2, max(20,length(v1)/10), axes = F, xlab = paste0(xlab, ' - ', ylab),
            main = 'Histogram', ylab = 'Density',  c = 'black')
@@ -114,7 +114,7 @@ train.neural <- function(f, train.nn, hidden){
   tryCatch({
     return(neuralnet(f, train.nn, hidden = hidden, stepmax = 1e6))
   }, warning = function(e) {
-    cat(paste0('Neural network did not converge. Re-run and decrease --hidden or --nfeat. Alternatively, use --olm.\n'))
+    cat(paste0('Neural network did not converge. Re-run and decrease --hidden or optimize --nfeat. Alternatively, use --olm.\n'))
     quit(save = 'no')
   })
 }
@@ -194,7 +194,7 @@ train <- function(args){
     sample <- config.file$ID[i]
     cat(paste0('Loading sample ', sample, ' | ', nrow(config.file) - i, '/', nrow(config.file), ' remaining ...\n'))
     bin.table <- fread(config.file$filepath[i], header = T, sep = '\t')
-    return(as.numeric(bin.table$ratio[bin.table$chr != 'Y']))
+    return(suppressWarnings(as.numeric(bin.table$ratio[bin.table$chr != 'Y'])))
   }
 
   colnames(training.frame.sub) <- config.file$ID
@@ -217,7 +217,7 @@ train <- function(args){
   na.index <- which(is.na(training.frame), arr.ind=TRUE)
   training.frame[na.index] <- mean.features[na.index[,2]]
   
-  cat(paste0('Remaining training features after \'NaN\' filtering: ', length(possible.features), '\n'))
+  cat(paste0('Remaining training features after \'NA\' filtering: ', length(possible.features), '\n'))
   
   ## Predictive modeling
   
@@ -312,7 +312,7 @@ train <- function(args){
   axis(1, tcl=0.5)
   axis(2, tcl=0.5, las = 2)
   
-  legend('topright', legend = c('RLS fit', 'f(x)=x', paste0('(wρ = ', signif(r, 4), ')')),
+  legend('topright', legend = c('RLS fit', 'f(x)=x', paste0('(wr = ', signif(r, 4), ')')),
          bty = 'n', lty = c(2, 3, -1), col = c(color.A, color.B, 'black'), cex = 0.7, text.col = c(color.A, color.B, 'black'),
          text.font = c(2, 2, 1))
   
@@ -372,8 +372,8 @@ train <- function(args){
   cat('PREFACE - PREdict FetAl ComponEnt\n\n')
   if (length(outliers) != 0){
     cat(paste0('Below, some of the top candidates for outlier removal are listed.\n',
-      'If you know some of these are low quality/have sex aberrations (when using FFY), remove them from the config file and re-run.\n',
-      'Avoid removing other cases, as this will result in inaccurate performance statistics and possible overfitting towards unrelevant models.\n\n'))
+      'If you know some of these are low quality/have sex aberrations (when using FFY as response variable), remove them from the config file and re-run.\n',
+      'Avoid removing other cases, as this will result in inaccurate performance statistics and possible overfitting towards irrelevant models.\n\n'))
     cat('_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_\n')
     cat('ID\tFF (%) - PREFACE (%)\n')
     for (i in rev(order(outlier.values))){
@@ -383,7 +383,7 @@ train <- function(args){
   }
   elapsed.time <- proc.time() - start.time
   cat(paste0('Training time: ', as.character(round(elapsed.time[3])), ' seconds\n'))
-  cat(paste0('Overall correlation (ρ): ', info[5], '\n'))
+  cat(paste0('Overall correlation (r): ', info[5], '\n'))
   cat(paste0('Overall mean absolute error (MAE): ', info[3], ' ± ', info[4], '\n'))
   cat(paste0('FF < 10% mean absolute error (MAE): ', mean(deviations.10), ' ± ', sd(deviations.10), '\n'))
   cat(paste0('Correction for skew: \n'))
