@@ -246,7 +246,7 @@ train <- function(args){
     
     cat(paste0('\tExecuting principal component analysis ...\n'))
     pca.train <- suppressWarnings(prcomp_irlba(training.frame[-test.index.overall,],
-                              n = min(n.feat * 2, length(train.index.overall)), scale. = F))
+                              n = min(n.feat * 2, nrow(training.frame[-test.index.overall,]) - 1), scale. = F))
     
     X.train <- as.matrix(pca.train$x[train.index.subset, ])
     Y.train <- as.matrix(config.file$FF[train.index.overall], ncol = 1)
