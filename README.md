@@ -75,10 +75,11 @@ RScript PREFACE.R predict --infile path/to/infile.bed --model path/to/model.RDat
 - glmnet (v2.0-16)  
 - data.table (v1.11.8)  
 - MASS (v7.3-49)  
+- irlba (v2.3.3)  
 
 Other versions are of course expected to work equally well. To install within R use:  
 
 ```bash
 
-install.packages(c('data.table', 'glmnet', 'neuralnet', 'foreach', 'doParallel', 'MASS'))
+install.packages(c('data.table', 'glmnet', 'neuralnet', 'foreach', 'doParallel', 'MASS', 'irlba'))
 ```
