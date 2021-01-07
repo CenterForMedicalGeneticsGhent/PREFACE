@@ -246,7 +246,7 @@ train <- function(args){
     
     cat(paste0('\tExecuting principal component analysis ...\n'))
     pca.train <- suppressWarnings(prcomp_irlba(training.frame[-test.index.overall,],
-                              n = min(n.feat * 2, nrow(training.frame[-test.index.overall,]) - 1), scale. = F))
+                              n = min(n.feat * 10, nrow(training.frame[-test.index.overall,]) - 1), scale. = F))
     
     X.train <- as.matrix(pca.train$x[train.index.subset, ])
     Y.train <- as.matrix(config.file$FF[train.index.overall], ncol = 1)
@@ -346,7 +346,7 @@ train <- function(args){
   predictions <- the.intercept + the.slope * predictions
   
   cat(paste0('Executing final principal component analysis ...\n'))
-  pca.train <- suppressWarnings(prcomp_irlba(training.frame, n = min(n.feat * 2, nrow(training.frame) - 1), scale. = F))
+  pca.train <- suppressWarnings(prcomp_irlba(training.frame, n = min(n.feat * 10, nrow(training.frame) - 1), scale. = F))
   X.train <- as.matrix(pca.train$x[which(config.file$gender %in% train.gender), ])
   Y.train <- as.matrix(config.file$FF[which(config.file$gender %in% train.gender)], ncol = 1)
   
