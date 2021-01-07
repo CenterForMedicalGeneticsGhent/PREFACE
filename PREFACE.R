@@ -1,4 +1,4 @@
-version = 'v0.1.1'
+version = 'v0.1.2'
 
 # ---
 # Functions
@@ -132,6 +132,7 @@ train <- function(args){
   suppressMessages(library('foreach'))
   suppressMessages(library('doParallel'))
   suppressMessages(library('MASS'))
+  suppressMessages(library('irlba'))
   
   # Arg parse
   
@@ -203,7 +204,8 @@ train <- function(args){
 
   cat(paste0('Creating training frame ...\n'))
   
-  training.frame <- cbind(training.frame[!(training.frame$chr %in% exclude.chrs),], training.frame.sub[!(training.frame$chr %in% exclude.chrs),])
+  training.frame <- cbind(training.frame[!(training.frame$chr %in% exclude.chrs),],
+                          training.frame.sub[!(training.frame$chr %in% exclude.chrs),])
   training.frame.t <- t(training.frame[4:ncol(training.frame)])
   colnames(training.frame.t) <- paste0(training.frame$chr, ':', training.frame$start, '-', training.frame$end)
   
@@ -215,7 +217,7 @@ train <- function(args){
   mean.features <- colMeans(training.frame, na.rm = T)
   
   na.index <- which(is.na(training.frame), arr.ind=TRUE)
-  training.frame[na.index] <- mean.features[na.index[,2]]
+  if (length(na.index[,2])) training.frame[na.index] <- mean.features[na.index[,2]]
   
   cat(paste0('Remaining training features after \'NA\' filtering: ', length(possible.features), '\n'))
   
@@ -228,6 +230,12 @@ train <- function(args){
   
   test.number = length(which(config.file$gender %in% train.gender)) * test.percentage
   
+  max.feat <- length(which(config.file$gender %in% train.gender)) - as.integer(test.number) - 1
+  if (n.feat > max.feat){
+    cat(paste0('Too few samples were provided for --nfeat ', n.feat, ', using --nfeat ', max.feat, '\n'))
+    n.feat <- max.feat
+  }
+  
   oper <- foreach(i = 1:repeats) %dopar% {
 
     cat(paste0('Model training | Repeat ', i,'/', repeats, ' ...\n'))
@@ -237,7 +245,9 @@ train <- function(args){
     train.index.subset <- sort(which(config.file$gender[-test.index.overall] %in% train.gender))
     
     cat(paste0('\tExecuting principal component analysis ...\n'))
-    pca.train <- prcomp(training.frame[-test.index.overall,])
+    pca.train <- suppressWarnings(prcomp_irlba(training.frame[-test.index.overall,],
+                              n = min(n.feat * 10, nrow(training.frame[-test.index.overall,]) - 1), scale. = F))
+    
     X.train <- as.matrix(pca.train$x[train.index.subset, ])
     Y.train <- as.matrix(config.file$FF[train.index.overall], ncol = 1)
     X.test <- as.matrix(scale(training.frame[test.index.overall,], pca.train$center, pca.train$scale) %*% pca.train$rotation)
@@ -336,7 +346,7 @@ train <- function(args){
   predictions <- the.intercept + the.slope * predictions
   
   cat(paste0('Executing final principal component analysis ...\n'))
-  pca.train <- prcomp(training.frame)
+  pca.train <- suppressWarnings(prcomp_irlba(training.frame, n = min(n.feat * 10, nrow(training.frame) - 1), scale. = F))
   X.train <- as.matrix(pca.train$x[which(config.file$gender %in% train.gender), ])
   Y.train <- as.matrix(config.file$FF[which(config.file$gender %in% train.gender)], ncol = 1)
   
