@@ -1,3 +1,5 @@
+#!/usr/bin/env Rscript
+
 version = 'v0.1.2'
 
 # ---
