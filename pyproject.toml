@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "preface"
+version = "0.2.0dev"
+description = "PREdict FetAl ComponEnt (PREFACE) - Fetal fraction prediction from shallow whole-genome NIPT sequencing data"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+preface = "preface.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[tool.pixi.tasks]
+preface = "preface"
+train = "preface train"
+predict = "preface predict"
+test = "pytest"
+
+[tool.pixi.dependencies]
+python = ">=3.14"
+pytorch = ">=2.14"
+onnx = ">=1.23"
+onnxscript = ">=0.7"
+onnxruntime = ">=1.31"
+typer = ">=0.15"
+polars = ">=2.0"
+polars-runtime-compat = ">=2.0"
+numpy = ">=2.5"
+scipy = ">=1.18"
+matplotlib-base = ">=3.11"
+pytest = ">=9.1"
+pip = ">=26"
+setuptools = ">=84.0"
+wheel = ">=0.48"
+
+[tool.pixi.pypi-dependencies]
+preface = { path = ".", editable = true }
