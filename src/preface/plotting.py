@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -14,11 +16,32 @@ from preface import COLOR_A, COLOR_B, COLOR_C
 from preface.math_utils import get_m_diff, get_sd_diff, ols_fit, pearson_cor
 
 
+@dataclass(frozen=True)
+class PerformanceMetrics:
+    """Summary metrics computed during performance plotting."""
+
+    intercept: float
+    slope: float
+    mae: float
+    sd_diff: float
+    cor: float
+
+
 def _signif(value: float, digits: int = 3) -> str:
     """Format floating-point numbers to significant digits matching R's signif()."""
     if not np.isfinite(value):
         return "NA"
     return f"{value:.{digits}g}"
+
+
+def _style_axis(ax: Axes, xlabel: str, ylabel: str, title: str | None = None) -> None:
+    if title is not None:
+        ax.set_title(title, fontsize=9.5, fontweight="bold")
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
 
 def plot_performance(
@@ -29,11 +52,8 @@ def plot_performance(
     xlab: str,
     ylab: str,
     path: Path,
-) -> tuple[float, float, float, float, float]:
-    """Generate 3-panel performance diagnostic plot matching plot.performance in PREFACE.R.
-
-    Returns (intercept, slope, mae, sd_diff, cor).
-    """
+) -> PerformanceMetrics:
+    """Generate 3-panel performance diagnostic plot matching plot.performance in PREFACE.R."""
     v1_arr = np.asarray(v1, dtype=np.float64).ravel()
     v2_arr = np.asarray(v2, dtype=np.float64).ravel()
     imp = np.asarray(importance_prop, dtype=np.float64).ravel()
@@ -41,7 +61,6 @@ def plot_performance(
     fig, axes = plt.subplots(1, 3, figsize=(7.6, 2.65), dpi=1024)
     fig.subplots_adjust(left=0.09, right=0.98, bottom=0.20, top=0.86, wspace=0.30)
 
-    # Panel 1: PCA Proportion of variance (log-log)
     ax_pca = axes[0]
     nonzero_imp = imp[imp > 0]
     y_min = float(np.min(nonzero_imp)) if nonzero_imp.size > 0 else 1e-6
@@ -49,9 +68,7 @@ def plot_performance(
     n_pcs = max(1, imp.size)
     x_idx = np.arange(1, n_pcs + 1, dtype=np.float64)
 
-    log_x = np.log(x_idx)
-    log_y = np.log(np.clip(imp, y_min, None))
-    ax_pca.plot(log_x, log_y, color=COLOR_A, linewidth=1.8)
+    ax_pca.plot(np.log(x_idx), np.log(np.clip(imp, y_min, None)), color=COLOR_A, linewidth=1.8)
 
     log_nfeat = float(np.log(max(1, n_feat)))
     ax_pca.plot(
@@ -70,22 +87,16 @@ def plot_performance(
         va="bottom",
         fontsize=7.5,
     )
-
     ax_pca.set_xlim(0.0, float(np.log(max(2, n_pcs))))
     ax_pca.set_ylim(float(np.log(y_min)), float(np.log(y_max * 1.05)))
-    ax_pca.set_title("PCA", fontsize=9.5, fontweight="bold")
-    ax_pca.set_xlabel("Principal components", fontsize=8)
-    ax_pca.set_ylabel("Proportion of variance", fontsize=8)
+    _style_axis(ax_pca, "Principal components", "Proportion of variance", "PCA")
 
     x_ticks_raw = np.unique(np.round(np.linspace(1, n_pcs, num=min(6, n_pcs))).astype(int))
     ax_pca.set_xticks(np.log(x_ticks_raw))
     ax_pca.set_xticklabels([str(t) for t in x_ticks_raw], fontsize=7)
     ax_pca.set_yticks([np.log(y_min), np.log(y_max)])
     ax_pca.set_yticklabels([f"{y_min:.3g}", f"{y_max:.3g}"], fontsize=7)
-    ax_pca.spines["top"].set_visible(False)
-    ax_pca.spines["right"].set_visible(False)
 
-    # Panel 2: Scatter plot
     ax_scat = axes[1]
     mx = float(max(np.max(v1_arr, initial=1.0), np.max(v2_arr, initial=1.0)))
     ax_scat.scatter(v1_arr, v2_arr, s=10, color="black", edgecolors="none")
@@ -104,16 +115,10 @@ def plot_performance(
     )
     ax_scat.set_xlim(0.0, mx)
     ax_scat.set_ylim(0.0, mx)
-    ax_scat.set_title("Scatter plot", fontsize=9.5, fontweight="bold")
-    ax_scat.set_xlabel(xlab, fontsize=8)
-    ax_scat.set_ylabel(ylab, fontsize=8)
-    ax_scat.tick_params(labelsize=7)
+    _style_axis(ax_scat, xlab, ylab, "Scatter plot")
     ax_scat.text(0.0, mx * 1.03, f"(r = {_signif(cor_val, 3)})", fontsize=8, ha="left")
     ax_scat.legend(loc="upper left", frameon=False, fontsize=7.5)
-    ax_scat.spines["top"].set_visible(False)
-    ax_scat.spines["right"].set_visible(False)
 
-    # Panel 3: Histogram of (v1 - v2)
     ax_hist = axes[2]
     diffs = v1_arr - v2_arr
     n_bins = max(20, int(v1_arr.size / 10))
@@ -133,10 +138,7 @@ def plot_performance(
         linestyle="--",
         label="mean error",
     )
-    ax_hist.set_title("Histogram", fontsize=9.5, fontweight="bold")
-    ax_hist.set_xlabel(f"{xlab} - {ylab}", fontsize=8)
-    ax_hist.set_ylabel("Density", fontsize=8)
-    ax_hist.tick_params(labelsize=7)
+    _style_axis(ax_hist, f"{xlab} - {ylab}", "Density", "Histogram")
     ax_hist.text(
         float(np.min(breaks)),
         hist_mx * 1.03,
@@ -145,13 +147,17 @@ def plot_performance(
         ha="left",
     )
     ax_hist.legend(loc="upper left", frameon=False, fontsize=7.5)
-    ax_hist.spines["top"].set_visible(False)
-    ax_hist.spines["right"].set_visible(False)
 
     fig.savefig(path, dpi=1024)
     plt.close(fig)
 
-    return intercept, slope, mae_val, sd_val, cor_val
+    return PerformanceMetrics(
+        intercept=intercept,
+        slope=slope,
+        mae=mae_val,
+        sd_diff=sd_val,
+        cor=cor_val,
+    )
 
 
 def plot_ffx(
@@ -172,7 +178,6 @@ def plot_ffx(
     min_v1 = float(np.min(v1)) if v1.size > 0 else 0.0
     max_v1 = float(np.max(v1)) if v1.size > 0 else 1.0
 
-    # Left panel: FF (%) vs mean(ratio X)
     ax_left = axes[0]
     ax_left.scatter(v1, v2, s=8, color="black", edgecolors="none")
     ax_left.plot(
@@ -186,14 +191,9 @@ def plot_ffx(
     ax_left.plot([], [], color=COLOR_B, linewidth=2.0, linestyle=":", label="f(x)=x")
     ax_left.plot([], [], color="none", label=f"(wr = {_signif(weighted_r, 4)})")
     ax_left.set_xlim(0.0, max_v1)
-    ax_left.set_xlabel("FF (%)", fontsize=8)
-    ax_left.set_ylabel("μ(ratio X)", fontsize=8)
-    ax_left.tick_params(labelsize=7)
+    _style_axis(ax_left, "FF (%)", "μ(ratio X)")
     ax_left.legend(loc="upper right", frameon=False, fontsize=6.5)
-    ax_left.spines["top"].set_visible(False)
-    ax_left.spines["right"].set_visible(False)
 
-    # Right panel: FF (%) vs FFX (%)
     ax_right = axes[1]
     ffx_vals = (v2 - fit_intercept) / fit_slope if abs(fit_slope) > 1e-12 else np.zeros_like(v2)
     ax_right.scatter(v1, ffx_vals, s=8, color="black", edgecolors="none")
@@ -205,11 +205,7 @@ def plot_ffx(
         linestyle=":",
     )
     ax_right.set_xlim(0.0, max_v1)
-    ax_right.set_xlabel("FF (%)", fontsize=8)
-    ax_right.set_ylabel("FFX (%)", fontsize=8)
-    ax_right.tick_params(labelsize=7)
-    ax_right.spines["top"].set_visible(False)
-    ax_right.spines["right"].set_visible(False)
+    _style_axis(ax_right, "FF (%)", "FFX (%)")
 
     fig.savefig(path, dpi=1024)
     plt.close(fig)

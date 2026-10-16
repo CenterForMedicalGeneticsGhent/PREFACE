@@ -41,14 +41,7 @@ class PrefacePredictor(nn.Module):
 
 
 class PrefaceFullPipeline(nn.Module):
-    """End-to-end ONNX-exportable PREFACE inference module.
-
-    Encapsulates:
-    1. NaN feature imputation with training column means
-    2. PCA centering and projection onto top n_feat principal components
-    3. Neural network or OLM forward pass
-    4. Skew correction (intercept + slope * prediction)
-    """
+    """End-to-end ONNX-exportable PREFACE inference module."""
 
     def __init__(
         self,
@@ -108,25 +101,15 @@ def train_olm(
 ) -> PrefacePredictor:
     """Fit unregularized Gaussian linear model matching glmnet(..., family='gaussian', lambda=0)."""
     n_samples, n_feat = x_train.shape
-    use_dtype = torch.float32 if device.type == "mps" else torch.float64
-
-    x_t = torch.as_tensor(x_train, dtype=use_dtype, device=device)
-    y_t = torch.as_tensor(y_train, dtype=use_dtype, device=device).reshape(n_samples, 1)
-    ones = torch.ones((n_samples, 1), dtype=use_dtype, device=device)
-    design = torch.cat([ones, x_t], dim=1)
-
-    if device.type == "mps":
-        sol = torch.linalg.lstsq(design.cpu().to(torch.float64), y_t.cpu().to(torch.float64)).solution
-    else:
-        sol = torch.linalg.lstsq(design, y_t).solution.cpu()
-
-    intercept = sol[0, 0].to(torch.float32)
-    weights = sol[1:, 0].to(torch.float32).unsqueeze(0)
+    design = np.column_stack([np.ones(n_samples, dtype=np.float64), x_train])
+    coeffs, _, _, _ = np.linalg.lstsq(design, y_train.ravel(), rcond=None)
 
     model = PrefacePredictor(n_feat=n_feat, hidden=0, is_olm=True)
     with torch.no_grad():
-        model.output_layer.weight.copy_(weights)
-        model.output_layer.bias.copy_(intercept.unsqueeze(0))
+        model.output_layer.bias.fill_(float(coeffs[0]))
+        model.output_layer.weight.copy_(
+            torch.as_tensor(coeffs[1:], dtype=torch.float32).unsqueeze(0)
+        )
     return model.to(device)
 
 
@@ -187,6 +170,22 @@ def train_neural_net(
     return model.to(device)
 
 
+def fit_predictor(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    hidden: int,
+    is_olm: bool,
+    device: torch.device,
+    log_prefix: str = "",
+) -> PrefacePredictor:
+    """Dispatch training to either OLM or Rprop neural network."""
+    if is_olm:
+        print(f"{log_prefix}Training ordinary linear model ...")
+        return train_olm(x_train, y_train, device=device)
+    print(f"{log_prefix}Training neural network ...")
+    return train_neural_net(x_train, y_train, hidden=hidden, device=device)
+
+
 @torch.no_grad()
 def predict_model(
     model: PrefacePredictor,
@@ -197,8 +196,7 @@ def predict_model(
     model.eval()
     eval_device = next(model.parameters()).device
     x_t = torch.as_tensor(x_eval, dtype=torch.float32, device=eval_device)
-    preds = model(x_t).squeeze(-1).cpu().numpy().astype(np.float64)
-    return preds
+    return model(x_t).squeeze(-1).cpu().numpy().astype(np.float64)
 
 
 def export_pipeline_to_onnx(
@@ -224,8 +222,7 @@ def export_pipeline_to_onnx(
         the_slope=the_slope,
     ).eval()
 
-    n_features = len(possible_features)
-    dummy_input = torch.zeros((1, n_features), dtype=torch.float32)
+    dummy_input = torch.zeros((1, len(possible_features)), dtype=torch.float32)
     batch_dim = torch.export.Dim("batch_size", min=1)
 
     onnx_program = torch.onnx.export(
@@ -287,5 +284,4 @@ def run_onnx_inference(
     session = ort.InferenceSession(str(onnx_path), providers=providers)
     input_tensor = np.asarray(feature_ratios, dtype=np.float32).reshape(1, -1)
     outputs = session.run(["preface_prediction"], {"ratio": input_tensor})
-    prediction = float(np.asarray(outputs[0]).ravel()[0])
-    return prediction
+    return float(np.asarray(outputs[0]).ravel()[0])
