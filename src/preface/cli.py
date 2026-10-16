@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -46,15 +46,21 @@ def common_options(
 def train_cmd(
     config: Annotated[
         Path,
-        typer.Option("--config", help="Path to tab-separated training config.txt file."),
+        typer.Option(
+            "--config", help="Path to tab-separated training config.txt file."
+        ),
     ],
     outdir: Annotated[
         Path,
-        typer.Option("--outdir", help="Output directory for trained model.onnx and plots."),
+        typer.Option(
+            "--outdir", help="Output directory for trained model.onnx and plots."
+        ),
     ],
     nfeat: Annotated[
         int,
-        typer.Option("--nfeat", help="Number of principal components to use during modeling."),
+        typer.Option(
+            "--nfeat", help="Number of principal components to use during modeling."
+        ),
     ] = 50,
     hidden: Annotated[
         int,
@@ -73,11 +79,16 @@ def train_cmd(
     ] = False,
     olm: Annotated[
         bool,
-        typer.Option("--olm", help="Use an ordinary linear model instead of a neural network."),
+        typer.Option(
+            "--olm", help="Use an ordinary linear model instead of a neural network."
+        ),
     ] = False,
     noskewcorrect: Annotated[
         bool,
-        typer.Option("--noskewcorrect", help="Disable linear skew correction on cross-validated predictions."),
+        typer.Option(
+            "--noskewcorrect",
+            help="Disable linear skew correction on cross-validated predictions.",
+        ),
     ] = False,
     device: Annotated[
         str,
@@ -113,7 +124,9 @@ def train_cmd(
 def predict_cmd(
     infile: Annotated[
         Path,
-        typer.Option("--infile", help="Path to sample copy number alteration .bed file."),
+        typer.Option(
+            "--infile", help="Path to sample copy number alteration .bed file."
+        ),
     ],
     model: Annotated[
         Path,
@@ -128,7 +141,9 @@ def predict_cmd(
     ] = None,
     device: Annotated[
         str,
-        typer.Option("--device", help="Execution device for ONNX Runtime (auto, cpu, cuda, mps)."),
+        typer.Option(
+            "--device", help="Execution device for ONNX Runtime (auto, cpu, cuda, mps)."
+        ),
     ] = "auto",
 ) -> None:
     """Predict fetal fraction (FFX and PREFACE) for an input BED file using a trained ONNX model."""
@@ -152,11 +167,10 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--json":
-            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
-                normalized.extend(["--json", ""])
-                i += 1
-                continue
+        if arg == "--json" and (i + 1 >= len(argv) or argv[i + 1].startswith("-")):
+            normalized.extend(["--json", ""])
+            i += 1
+            continue
         normalized.append(arg)
         i += 1
     return normalized

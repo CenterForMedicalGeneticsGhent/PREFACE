@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -129,12 +129,16 @@ def train_neural_net(
         else device
     )
 
-    model = PrefacePredictor(n_feat=n_feat, hidden=hidden, is_olm=False).to(train_device)
+    model = PrefacePredictor(n_feat=n_feat, hidden=hidden, is_olm=False).to(
+        train_device
+    )
     for param in model.parameters():
         nn.init.normal_(param, mean=0.0, std=1.0)
 
     x_t = torch.as_tensor(x_train, dtype=torch.float32, device=train_device)
-    y_t = torch.as_tensor(y_train, dtype=torch.float32, device=train_device).reshape(n_samples, 1)
+    y_t = torch.as_tensor(y_train, dtype=torch.float32, device=train_device).reshape(
+        n_samples, 1
+    )
 
     optimizer = torch.optim.Rprop(
         model.parameters(),
@@ -153,7 +157,8 @@ def train_neural_net(
         loss.backward()
 
         if all(
-            p.grad is not None and bool((p.grad.detach().abs().max() < threshold).item())
+            p.grad is not None
+            and bool((p.grad.detach().abs().max() < threshold).item())
             for p in params
         ):
             converged = True
@@ -259,10 +264,18 @@ def load_onnx_metadata(onnx_path: Path) -> ONNXModelMetadata:
     """Read PREFACE metadata properties from a saved model.onnx file."""
     onnx_model = onnx.load(str(onnx_path), load_external_data=False)
     props = {entry.key: entry.value for entry in onnx_model.metadata_props}
-    required_keys = {"possible_features", "the_intercept_X", "the_slope_X", "n_feat", "is_olm"}
+    required_keys = {
+        "possible_features",
+        "the_intercept_X",
+        "the_slope_X",
+        "n_feat",
+        "is_olm",
+    }
     missing = required_keys - props.keys()
     if missing:
-        raise ValueError(f"ONNX model '{onnx_path}' is missing required PREFACE metadata: {missing}")
+        raise ValueError(
+            f"ONNX model '{onnx_path}' is missing required PREFACE metadata: {missing}"
+        )
 
     return ONNXModelMetadata(
         possible_features=json.loads(props["possible_features"]),
