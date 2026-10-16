@@ -8,9 +8,9 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
 
 from preface import COLOR_A, COLOR_B, COLOR_C
 from preface.math_utils import get_m_diff, get_sd_diff, ols_fit, pearson_cor
@@ -68,7 +68,9 @@ def plot_performance(
     n_pcs = max(1, imp.size)
     x_idx = np.arange(1, n_pcs + 1, dtype=np.float64)
 
-    ax_pca.plot(np.log(x_idx), np.log(np.clip(imp, y_min, None)), color=COLOR_A, linewidth=1.8)
+    ax_pca.plot(
+        np.log(x_idx), np.log(np.clip(imp, y_min, None)), color=COLOR_A, linewidth=1.8
+    )
 
     log_nfeat = float(np.log(max(1, n_feat)))
     ax_pca.plot(
@@ -91,7 +93,9 @@ def plot_performance(
     ax_pca.set_ylim(float(np.log(y_min)), float(np.log(y_max * 1.05)))
     _style_axis(ax_pca, "Principal components", "Proportion of variance", "PCA")
 
-    x_ticks_raw = np.unique(np.round(np.linspace(1, n_pcs, num=min(6, n_pcs))).astype(int))
+    x_ticks_raw = np.unique(
+        np.round(np.linspace(1, n_pcs, num=min(6, n_pcs))).astype(int)
+    )
     ax_pca.set_xticks(np.log(x_ticks_raw))
     ax_pca.set_xticklabels([str(t) for t in x_ticks_raw], fontsize=7)
     ax_pca.set_yticks([np.log(y_min), np.log(y_max)])
@@ -104,7 +108,14 @@ def plot_performance(
     intercept, slope = ols_fit(v1_arr, v2_arr)
     cor_val = pearson_cor(v1_arr, v2_arr)
 
-    ax_scat.plot([0.0, mx], [0.0, mx], color=COLOR_B, linewidth=2.0, linestyle=":", label="f(x)=x")
+    ax_scat.plot(
+        [0.0, mx],
+        [0.0, mx],
+        color=COLOR_B,
+        linewidth=2.0,
+        linestyle=":",
+        label="f(x)=x",
+    )
     ax_scat.plot(
         [0.0, mx],
         [intercept, intercept + mx * slope],
@@ -122,14 +133,23 @@ def plot_performance(
     ax_hist = axes[2]
     diffs = v1_arr - v2_arr
     n_bins = max(20, int(v1_arr.size / 10))
-    counts, breaks, _ = ax_hist.hist(diffs, bins=n_bins, color="black", edgecolor="white", linewidth=0.4)
+    counts, breaks, _ = ax_hist.hist(
+        diffs, bins=n_bins, color="black", edgecolor="white", linewidth=0.4
+    )
     hist_mx = float(np.max(counts)) if counts.size > 0 else 1.0
 
     mean_signed_diff = get_m_diff(v1_arr, v2_arr, use_abs=False)
     mae_val = get_m_diff(v1_arr, v2_arr, use_abs=True)
     sd_val = get_sd_diff(v1_arr, v2_arr)
 
-    ax_hist.plot([0.0, 0.0], [0.0, hist_mx], color=COLOR_B, linewidth=2.0, linestyle=":", label="x=0")
+    ax_hist.plot(
+        [0.0, 0.0],
+        [0.0, hist_mx],
+        color=COLOR_B,
+        linewidth=2.0,
+        linestyle=":",
+        label="x=0",
+    )
     ax_hist.plot(
         [mean_signed_diff, mean_signed_diff],
         [0.0, hist_mx],
@@ -195,7 +215,11 @@ def plot_ffx(
     ax_left.legend(loc="upper right", frameon=False, fontsize=6.5)
 
     ax_right = axes[1]
-    ffx_vals = (v2 - fit_intercept) / fit_slope if abs(fit_slope) > 1e-12 else np.zeros_like(v2)
+    ffx_vals = (
+        (v2 - fit_intercept) / fit_slope
+        if abs(fit_slope) > 1e-12
+        else np.zeros_like(v2)
+    )
     ax_right.scatter(v1, ffx_vals, s=8, color="black", edgecolors="none")
     ax_right.plot(
         [min_v1, max_v1],

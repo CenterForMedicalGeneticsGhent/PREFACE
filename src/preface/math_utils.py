@@ -47,7 +47,9 @@ def pca_irlba_torch(
         u_k = evecs.flip(1)[:, :k]
         s_k = torch.sqrt(evals)
         safe_s = torch.where(s_k > 1e-12, s_k, torch.ones_like(s_k))
-        x_linalg = torch.as_tensor(centered_np, dtype=torch.float64, device=linalg_device)
+        x_linalg = torch.as_tensor(
+            centered_np, dtype=torch.float64, device=linalg_device
+        )
         v_k = ((x_linalg.T @ u_k) / safe_s.unsqueeze(0)).cpu()
         u_k = u_k.cpu()
         s_k = s_k.cpu()
@@ -88,7 +90,9 @@ def get_m_diff(v1: np.ndarray, v2: np.ndarray, use_abs: bool = True) -> float:
 
 def get_sd_diff(v1: np.ndarray, v2: np.ndarray) -> float:
     """Compute sample standard deviation (ddof=1) of absolute errors matching get.sd.diff."""
-    abs_diff = np.abs(np.asarray(v1, dtype=np.float64) - np.asarray(v2, dtype=np.float64))
+    abs_diff = np.abs(
+        np.asarray(v1, dtype=np.float64) - np.asarray(v2, dtype=np.float64)
+    )
     return float(np.std(abs_diff, ddof=1)) if abs_diff.size > 1 else 0.0
 
 

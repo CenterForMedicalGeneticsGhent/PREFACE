@@ -29,7 +29,9 @@ def resolve_device(requested: str = "auto") -> torch.device:
         return torch.device("mps")
     if req == "cpu":
         return torch.device("cpu")
-    raise ValueError(f"Unsupported device '{requested}'. Choose from: auto, cpu, cuda, mps.")
+    raise ValueError(
+        f"Unsupported device '{requested}'. Choose from: auto, cpu, cuda, mps."
+    )
 
 
 def configure_hardware(cpus: int, seed: int = 1) -> int:

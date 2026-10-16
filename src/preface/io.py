@@ -36,7 +36,13 @@ class SampleBedData:
 
 
 def _locus_id_expr() -> pl.Expr:
-    return pl.col("chr") + ":" + pl.col("start").cast(pl.String) + "-" + pl.col("end").cast(pl.String)
+    return (
+        pl.col("chr")
+        + ":"
+        + pl.col("start").cast(pl.String)
+        + "-"
+        + pl.col("end").cast(pl.String)
+    )
 
 
 def load_config(config_path: Path, rng: np.random.Generator) -> pl.DataFrame:
@@ -54,7 +60,9 @@ def load_config(config_path: Path, rng: np.random.Generator) -> pl.DataFrame:
     )
     missing = [c for c in REQUIRED_CONFIG_COLS if c not in df.columns]
     if missing:
-        raise ValueError(f"Config file '{config_path}' is missing required columns: {missing}")
+        raise ValueError(
+            f"Config file '{config_path}' is missing required columns: {missing}"
+        )
 
     return df[rng.permutation(df.height)]
 
@@ -89,7 +97,9 @@ def load_training_dataset(
 ) -> TrainingDataset:
     """Load all training BED files concurrently, compute X ratios, filter NAs, and mean-impute."""
     n_samples = config_df.height
-    ref_df = _read_bed_table(Path(config_df["filepath"][0])).filter(pl.col("chr") != "Y")
+    ref_df = _read_bed_table(Path(config_df["filepath"][0])).filter(
+        pl.col("chr") != "Y"
+    )
 
     tasks = [
         (i, n_samples, str(config_df["ID"][i]), str(config_df["filepath"][i]))
@@ -114,7 +124,9 @@ def load_training_dataset(
         .to_list()
     )
 
-    training_frame = np.ascontiguousarray(sub_matrix[keep_chr_mask, :].T, dtype=np.float64)
+    training_frame = np.ascontiguousarray(
+        sub_matrix[keep_chr_mask, :].T, dtype=np.float64
+    )
     valid_feature_mask = np.isnan(training_frame).sum(axis=0) < (n_samples * 0.01)
 
     training_frame = training_frame[:, valid_feature_mask]
@@ -141,7 +153,11 @@ def load_training_dataset(
 def load_inference_bed(bed_path: Path, possible_features: list[str]) -> SampleBedData:
     """Parse a single BED file for inference, returning X.ratio and ordered feature ratios."""
     df = _read_bed_table(bed_path)
-    x_vals = df.filter(pl.col("chr") == "X")["ratio"].to_numpy().astype(np.float64, copy=False)
+    x_vals = (
+        df.filter(pl.col("chr") == "X")["ratio"]
+        .to_numpy()
+        .astype(np.float64, copy=False)
+    )
     x_ratio = float(2.0 ** np.nanmean(x_vals))
 
     feat_ids = df.select(_locus_id_expr().alias("locus"))["locus"].to_list()

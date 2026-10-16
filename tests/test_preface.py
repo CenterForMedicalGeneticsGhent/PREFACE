@@ -13,7 +13,14 @@ from typer.testing import CliRunner
 
 from preface.cli import _normalize_argv, app
 from preface.hardware import configure_hardware, get_onnx_providers, resolve_device
-from preface.math_utils import get_m_diff, get_sd_diff, ols_fit, pca_irlba_torch, pearson_cor, rlm_huber
+from preface.math_utils import (
+    get_m_diff,
+    get_sd_diff,
+    ols_fit,
+    pca_irlba_torch,
+    pearson_cor,
+    rlm_huber,
+)
 from preface.models import (
     export_pipeline_to_onnx,
     load_onnx_metadata,
@@ -117,7 +124,11 @@ def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
     expected_imputed = raw_x[0].copy()
     expected_imputed[3] = mean_features[3]
     expected_pc = (expected_imputed - pca_res.center) @ pca_res.rotation[:, :n_feat]
-    expected_raw = float(predict_model(nn_model, expected_pc.reshape(1, -1), device=torch.device("cpu"))[0])
+    expected_raw = float(
+        predict_model(nn_model, expected_pc.reshape(1, -1), device=torch.device("cpu"))[
+            0
+        ]
+    )
     expected_final = 0.5 + 1.1 * expected_raw
 
     onnx_pred = run_onnx_inference(onnx_path, sample_with_nan, requested_device="cpu")
@@ -145,7 +156,9 @@ def _create_synthetic_cohort(base_dir: Path, n_samples: int = 24) -> tuple[Path,
         # Encode X copy number ratio relationship for males
         for idx, c in enumerate(chrs):
             if c == "X":
-                ratios[idx] = np.log2(max(0.5, 1.0 - 0.004 * ff + rng.normal(0.0, 0.001)))
+                ratios[idx] = np.log2(
+                    max(0.5, 1.0 - 0.004 * ff + rng.normal(0.0, 0.001))
+                )
 
         # Always NaN on locus 0 (simulating centromere/telomere)
         ratios[0] = np.nan
@@ -156,10 +169,7 @@ def _create_synthetic_cohort(base_dir: Path, n_samples: int = 24) -> tuple[Path,
                 "chr": chrs,
                 "start": starts,
                 "end": ends,
-                "ratio": [
-                    "NaN" if np.isnan(val) else f"{val:.8f}"
-                    for val in ratios
-                ],
+                "ratio": ["NaN" if np.isnan(val) else f"{val:.8f}" for val in ratios],
             }
         )
         df.write_csv(bed_path, separator="\t")
@@ -198,7 +208,15 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
     # Test CLI predict in default, bare --json, and --json <file> modes
     res_std = runner.invoke(
         app,
-        ["predict", "--infile", str(sample_bed), "--model", str(onnx_path), "--device", "cpu"],
+        [
+            "predict",
+            "--infile",
+            str(sample_bed),
+            "--model",
+            str(onnx_path),
+            "--device",
+            "cpu",
+        ],
     )
     assert res_std.exit_code == 0
     assert "FFX =" in res_std.stdout
@@ -250,6 +268,8 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
     )
     assert res_train_olm.exit_code == 0
     assert (outdir_olm / "model.onnx").is_file()
-    ffx_val, pref_val = run_predict(sample_bed, outdir_olm / "model.onnx", device_name="cpu")
+    ffx_val, pref_val = run_predict(
+        sample_bed, outdir_olm / "model.onnx", device_name="cpu"
+    )
     assert np.isfinite(ffx_val)
     assert np.isfinite(pref_val)

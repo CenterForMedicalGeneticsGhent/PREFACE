@@ -47,6 +47,8 @@ pytest = ">=9.1"
 pip = ">=26"
 setuptools = ">=84.0"
 wheel = ">=0.48"
+prek = ">=0.5.5,<0.6"
+ruff = ">=0.17.1,<0.18"
 
 [tool.pixi.pypi-dependencies]
 preface = { path = ".", editable = true }

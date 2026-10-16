@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -112,7 +112,9 @@ def _write_training_statistics(
     index_10 = labeled_ff < (20.0 - predictions)
     deviations_10 = np.abs(predictions[index_10] - labeled_ff[index_10])
     mae_10 = float(np.mean(deviations_10)) if deviations_10.size > 0 else float("nan")
-    sd_10 = float(np.std(deviations_10, ddof=1)) if deviations_10.size > 1 else float("nan")
+    sd_10 = (
+        float(np.std(deviations_10, ddof=1)) if deviations_10.size > 1 else float("nan")
+    )
 
     deviations = np.abs(predictions - labeled_ff)
     outlier_threshold = metrics.mae + 3.0 * metrics.sd_diff
@@ -205,7 +207,9 @@ def run_train(
     repeats = 10
     max_feat = n_labeled - int(n_labeled / repeats) - 1
     if n_feat > max_feat:
-        print(f"Too few samples were provided for --nfeat {n_feat}, using --nfeat {max_feat}")
+        print(
+            f"Too few samples were provided for --nfeat {n_feat}, using --nfeat {max_feat}"
+        )
         n_feat = max_feat
 
     labeled_indices = np.flatnonzero(labeled_mask)
@@ -234,7 +238,9 @@ def run_train(
     v1_male_ff = ff_all[male_mask]
     v2_male_x = dataset.x_ratios[male_mask]
     the_intercept_x, the_slope_x, wr = rlm_huber(v1_male_ff, v2_male_x)
-    plot_ffx(v1_male_ff, v2_male_x, the_intercept_x, the_slope_x, wr, outdir / "FFX.png")
+    plot_ffx(
+        v1_male_ff, v2_male_x, the_intercept_x, the_slope_x, wr, outdir / "FFX.png"
+    )
 
     predictions = the_intercept + the_slope * predictions
 
