@@ -1,6 +1,6 @@
 """PREFACE: PREdict FetAl ComponEnt."""
 
-__version__ = "v0.1.2"
+__version__ = "0.2.0"
 
 EXCLUDE_CHRS: frozenset[str] = frozenset({"13", "18", "21", "X", "Y"})
 
