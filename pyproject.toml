@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "preface"
+version = "0.1.2"
+description = "PREdict FetAl ComponEnt (PREFACE) - Fetal fraction prediction from shallow whole-genome NIPT sequencing data"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+preface = "preface.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

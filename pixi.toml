@@ -1,0 +1,32 @@
+[workspace]
+name = "preface"
+version = "0.1.2"
+description = "PREdict FetAl ComponEnt (PREFACE) - Python/PyTorch/ONNX implementation"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[tasks]
+preface = "preface"
+train = "preface train"
+predict = "preface predict"
+test = "pytest"
+
+[dependencies]
+python = ">=3.14"
+pytorch = ">=2.14"
+onnx = ">=1.23"
+onnxscript = ">=0.7"
+onnxruntime = ">=1.31"
+typer = ">=0.15"
+polars = ">=2.0"
+polars-runtime-compat = ">=2.0"
+numpy = ">=2.5"
+scipy = ">=1.18"
+matplotlib-base = ">=3.11"
+pytest = ">=9.1"
+pip = ">=26"
+setuptools = ">=84.0"
+wheel = ">=0.48"
+
+[pypi-dependencies]
+preface = { path = ".", editable = true }
