@@ -4130,4 +4130,4 @@ packages:
   timestamp: 1786599629846
 - pypi: ./
   name: preface
-  requires_python: '>=3.12'
+  requires_python: '>=3.14'
