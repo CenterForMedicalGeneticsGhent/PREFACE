@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "preface"
-version = "0.2.0"
+version = "0.2.0dev"
 description = "PREdict FetAl ComponEnt (PREFACE) - Fetal fraction prediction from shallow whole-genome NIPT sequencing data"
 readme = "README.md"
 license = { file = "LICENSE" }
