@@ -4,6 +4,20 @@ A share of all cell-free DNA fragments isolated from maternal plasma during preg
 
 # Manual
 
+## Installation
+
+Install the dependencies using `pixi`:
+
+```bash
+pixi install
+```
+
+and run the script using `pixi run`:
+
+```bash
+pixi run PREFACE.R <train/predict> ...
+```
+
 ## Required files
 
 ### Copy number alteration .bed files
@@ -65,21 +79,4 @@ RScript PREFACE.R predict --infile path/to/infile.bed --model path/to/model.RDat
         - A 'non-random' phase (representing PCs that explain variance caused by natural Gaussian noise).  
     - An optimal `--nfeat` captures the 'random' phase (as shown in the example at `./examples/overall_performance.png`). Capturing too much of the 'non-random' phase could lead to convergence problems during modeling.  
     - If you are not satisfied with the performance of your model or with the position of `--nfeat`, re-run with a different number of features.  
-- Note that the final model will probably be a bit more accurate than what is claimed by the performance statistics. This is because PREFACE uses a cross-validation strategy where 10% of the (male) samples are excluded from training, after which these 10% serve as validation cases. This process is repeated 10 times. Therefore, the final performance measurements are based on models trained with only 90% of the (male) fetuses, yet the resulting model is trained with all provided cases.  
-
-# Required R packages
-
-- doParallel (v1.0.14)  
-- foreach (v1.4.4)  
-- neuralnet (v1.44.2)  
-- glmnet (v2.0-16)  
-- data.table (v1.11.8)  
-- MASS (v7.3-49)  
-- irlba (v2.3.3)  
-
-Other versions are of course expected to work equally well. To install within R use:  
-
-```bash
-
-install.packages(c('data.table', 'glmnet', 'neuralnet', 'foreach', 'doParallel', 'MASS', 'irlba'))
-```
+- Note that the final model will probably be a bit more accurate than what is claimed by the performance statistics. This is because PREFACE uses a cross-validation strategy where 10% of the (male) samples are excluded from training, after which these 10% serve as validation cases. This process is repeated 10 times. Therefore, the final performance measurements are based on models trained with only 90% of the (male) fetuses, yet the resulting model is trained with all provided cases.
