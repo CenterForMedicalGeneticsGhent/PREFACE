@@ -21,6 +21,20 @@ The original R script (`PREFACE.R`) remains in the repository for reference.
 
 # Manual
 
+## Installation
+
+Install the dependencies using `pixi`:
+
+```bash
+pixi install
+```
+
+and run the script using `pixi run`:
+
+```bash
+pixi run PREFACE.R <train/predict> ...
+```
+
 ## Required files
 
 ### Copy number alteration .bed files
