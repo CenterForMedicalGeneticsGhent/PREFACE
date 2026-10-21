@@ -550,11 +550,12 @@ def run_ffy_cohort(
     df = pl.read_csv(
         config_path, separator="\t", null_values=NA_VALUES, infer_schema_length=1000
     )
-    for req_col in ("ID", "filepath"):
-        if req_col not in df.columns:
-            raise ValueError(
-                f"Cohort file '{config_path}' is missing required column '{req_col}'."
-            )
+    if "ID" not in df.columns and (
+        "filepath" not in df.columns or "reads_filepath" not in df.columns
+    ):
+        raise ValueError(
+            f"Cohort file '{config_path}' is missing required column 'ID' or 'filepath/reads_filepath'."
+        )
 
     n_samples = df.height
     if n_samples == 0:
