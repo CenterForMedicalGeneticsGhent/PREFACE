@@ -22,7 +22,7 @@ testpaths = ["tests"]
 addopts = "-q"
 
 [tool.pixi.workspace]
-channels = ["conda-forge"]
+channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.tasks]
@@ -53,6 +53,7 @@ setuptools = ">=84.0"
 wheel = ">=0.48"
 prek = ">=0.5.5,<0.6"
 ruff = ">=0.17.1,<0.18"
+pysam = ">=0.24.1,<0.25"
 
 [tool.pixi.pypi-dependencies]
 preface = { path = ".", editable = true }
