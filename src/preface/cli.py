@@ -10,6 +10,18 @@ from typing import Annotated
 import typer
 
 from preface import __version__
+from preface.logging_utils import LogLevel, configure_logging, get_logger
+
+logger = get_logger(__name__)
+
+LogLevelOption = Annotated[
+    LogLevel | None,
+    typer.Option(
+        "--loglevel",
+        case_sensitive=False,
+        help="Logging verbosity level (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
+    ),
+]
 
 app = typer.Typer(
     name="preface",
@@ -38,8 +50,17 @@ def common_options(
             is_eager=True,
         ),
     ] = False,
+    loglevel: Annotated[
+        LogLevel,
+        typer.Option(
+            "--loglevel",
+            case_sensitive=False,
+            help="Logging verbosity level (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
+        ),
+    ] = LogLevel.INFO,
 ) -> None:
     """PREFACE command line interface."""
+    configure_logging(loglevel)
 
 
 @app.command("train")
@@ -98,9 +119,13 @@ def train_cmd(
         int,
         typer.Option("--seed", help="Random seed for reproducibility."),
     ] = 1,
+    loglevel: LogLevelOption = None,
 ) -> None:
     """Train a PREFACE model and export it to ONNX."""
     from preface.pipeline import run_train
+
+    if loglevel is not None:
+        configure_logging(loglevel)
 
     try:
         run_train(
@@ -116,7 +141,7 @@ def train_cmd(
             seed=seed,
         )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-        typer.echo(str(exc))
+        logger.error("%s", exc)
         raise typer.Exit(code=1) from exc
 
 
@@ -145,9 +170,13 @@ def predict_cmd(
             "--device", help="Execution device for ONNX Runtime (auto, cpu, cuda, mps)."
         ),
     ] = "auto",
+    loglevel: LogLevelOption = None,
 ) -> None:
     """Predict fetal fraction (FFX and PREFACE) for an input BED file using a trained ONNX model."""
     from preface.pipeline import run_predict
+
+    if loglevel is not None:
+        configure_logging(loglevel)
 
     try:
         run_predict(
@@ -157,7 +186,7 @@ def predict_cmd(
             device_name=device,
         )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-        typer.echo(str(exc))
+        logger.error("%s", exc)
         raise typer.Exit(code=1) from exc
 
 
@@ -262,9 +291,13 @@ def ffy_cmd(
         int,
         typer.Option("--seed", help="Random seed for reproducibility."),
     ] = 1,
+    loglevel: LogLevelOption = None,
 ) -> None:
     """Calculate baseline chromosome Y fetal fraction (FFY) from binned read counts or aligned reads."""
     from preface.ffy import run_ffy_cohort, run_ffy_single
+
+    if loglevel is not None:
+        configure_logging(loglevel)
 
     try:
         if (config is None) == (infile is None):
@@ -297,7 +330,7 @@ def ffy_cmd(
                 device_name=device,
             )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-        typer.echo(str(exc))
+        logger.error("%s", exc)
         raise typer.Exit(code=1) from exc
 
 

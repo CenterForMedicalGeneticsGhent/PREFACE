@@ -119,6 +119,7 @@ In single-sample mode, `preface ffy` prints `gender` and `FFY` to stdout (or wri
 | `--json [x]` | In single-sample mode, write predictions as JSON to stdout or to file `x`. |
 | `--cpus x` | Number of CPU threads for parallel sample loading. (default: all available cores) |
 | `--seed x` | Random seed for reproducible cross-validation. (default: `x=1`) |
+| `--loglevel x` | Logging verbosity level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). (default: `x=INFO`) |
 
 ## Model training
 
@@ -136,6 +137,7 @@ pixi run preface train --config path/to/config.txt --outdir path/to/dir/ [option
 | `--noskewcorrect` | This flag ascertains the best fit for most (instead of all) of the data is generated. Mostly not recommended. |
 | `--device x` | Compute accelerator to use (`auto`, `cpu`, `cuda`, `mps`). Selects CUDA or Apple Silicon MPS when available. (default: `auto`) |
 | `--seed x` | Random seed for reproducible shuffling, cross-validation, and initialization. (default: `x=1`) |
+| `--loglevel x` | Logging verbosity level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). (default: `x=INFO`) |
 
 Training writes `model.onnx` into `--outdir` as a self-contained ONNX graph that embeds NA mean-imputation, PCA centering and projection, the neural network or linear model weights, skew correction, and FFX regression parameters. It also writes `overall_performance.png`, per-fold plots under `training_repeats/repeat_1.png` through `repeat_10.png`, `FFX.png`, and `training_statistics.txt`.
 
@@ -149,6 +151,7 @@ pixi run preface predict --infile path/to/infile.bed --model path/to/model.onnx 
 | :--- | :--- |
 | `--json [x]` | Predictions are written to stdout. Use `--json` for JSON format on stdout, or provide `--json path/to/output.json` to write to a JSON file. |
 | `--device x` | Execution device for ONNX Runtime (`auto`, `cpu`, `cuda`, `mps`). (default: `auto`) |
+| `--loglevel x` | Logging verbosity level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). (default: `x=INFO`) |
 
 ## Model optimization
 

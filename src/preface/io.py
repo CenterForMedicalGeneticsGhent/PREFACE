@@ -11,6 +11,9 @@ import numpy as np
 import polars as pl
 
 from preface import EXCLUDE_CHRS
+from preface.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 REQUIRED_CONFIG_COLS: tuple[str, ...] = ("ID", "filepath", "gender", "FF")
 REQUIRED_BED_COLS: tuple[str, ...] = ("chr", "start", "end", "ratio")
@@ -87,7 +90,9 @@ def _read_bed_table(bed_path: Path) -> pl.DataFrame:
 
 def _load_single_sample_ratios(args: tuple[int, int, str, str]) -> np.ndarray:
     idx, total, sample_id, filepath = args
-    print(f"Loading sample {sample_id} | {total - (idx + 1)}/{total} remaining ...")
+    logger.info(
+        "Loading sample %s | %d/%d remaining ...", sample_id, total - (idx + 1), total
+    )
     df = _read_bed_table(Path(filepath)).filter(pl.col("chr") != "Y")
     return df["ratio"].to_numpy().astype(np.float64, copy=False)
 
@@ -115,7 +120,7 @@ def load_training_dataset(
     with np.errstate(invalid="ignore"):
         x_ratios = np.power(2.0, np.nanmean(sub_matrix[x_mask, :], axis=0))
 
-    print("Creating training frame ...")
+    logger.info("Creating training frame ...")
 
     excluded = list(EXCLUDE_CHRS)
     keep_chr_mask = (~ref_df["chr"].is_in(excluded)).to_numpy()
@@ -140,7 +145,9 @@ def load_training_dataset(
     if na_cols.size > 0:
         training_frame[na_rows, na_cols] = mean_features[na_cols]
 
-    print(f"Remaining training features after 'NA' filtering: {len(possible_features)}")
+    logger.info(
+        "Remaining training features after 'NA' filtering: %d", len(possible_features)
+    )
 
     return TrainingDataset(
         config_df=config_df,

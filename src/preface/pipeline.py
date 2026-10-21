@@ -16,6 +16,7 @@ from preface.io import (
     load_inference_bed,
     load_training_dataset,
 )
+from preface.logging_utils import get_logger
 from preface.math_utils import ols_fit, pca_irlba_torch, rlm_huber
 from preface.models import (
     export_pipeline_to_onnx,
@@ -27,6 +28,8 @@ from preface.models import (
 
 if TYPE_CHECKING:
     from preface.plotting import PerformanceMetrics
+
+logger = get_logger(__name__)
 
 
 def _format_stat(val: float) -> str:
@@ -55,7 +58,7 @@ def _run_cross_validation(
     fold_predictions: list[np.ndarray] = []
 
     for rep in range(1, repeats + 1):
-        print(f"Model training | Repeat {rep}/{repeats} ...")
+        logger.info("Model training | Repeat %d/%d ...", rep, repeats)
 
         start_idx = (rep - 1) * n_labeled // repeats
         end_idx = rep * n_labeled // repeats
@@ -66,7 +69,7 @@ def _run_cross_validation(
         non_test_indices = np.flatnonzero(~is_test_overall)
         train_index_subset = np.flatnonzero(labeled_mask[non_test_indices])
 
-        print("\tExecuting principal component analysis ...")
+        logger.info("\tExecuting principal component analysis ...")
         pca_fold = pca_irlba_torch(
             training_frame[non_test_indices, :],
             n_components=min(n_feat * 10, non_test_indices.size - 1),
@@ -211,8 +214,10 @@ def run_train(
     repeats = 10
     max_feat = n_labeled - int(n_labeled / repeats) - 1
     if n_feat > max_feat:
-        print(
-            f"Too few samples were provided for --nfeat {n_feat}, using --nfeat {max_feat}"
+        logger.warning(
+            "Too few samples were provided for --nfeat %d, using --nfeat %d",
+            n_feat,
+            max_feat,
         )
         n_feat = max_feat
 
@@ -248,7 +253,7 @@ def run_train(
 
     predictions = the_intercept + the_slope * predictions
 
-    print("Executing final principal component analysis ...")
+    logger.info("Executing final principal component analysis ...")
     pca_final = pca_irlba_torch(
         training_frame,
         n_components=min(n_feat * 10, training_frame.shape[0] - 1),
@@ -299,8 +304,9 @@ def run_train(
         onnx_path=onnx_path,
     )
 
-    print(
-        f"Finished! Consult '{outdir_str}training_statistics.txt' to analyse your model's performance."
+    logger.info(
+        "Finished! Consult '%straining_statistics.txt' to analyse your model's performance.",
+        outdir_str,
     )
     return onnx_path
 
@@ -317,6 +323,7 @@ def run_predict(
     if not model_path.is_file():
         raise FileNotFoundError(f"The file '{model_path}' does not exist.")
 
+    logger.debug("Loading PREFACE ONNX model from '%s'", model_path)
     meta = load_onnx_metadata(model_path)
     sample_data = load_inference_bed(infile, meta.possible_features)
 
@@ -325,6 +332,9 @@ def run_predict(
         onnx_path=model_path,
         feature_ratios=sample_data.feature_ratios,
         requested_device=device_name,
+    )
+    logger.debug(
+        "Predicted FFX=%.4f%%, PREFACE=%.4f%% for '%s'", ffx, prediction, infile
     )
 
     emit_prediction_output(

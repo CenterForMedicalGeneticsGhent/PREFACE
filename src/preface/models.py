@@ -15,6 +15,9 @@ from torch import nn
 
 from preface import __version__
 from preface.hardware import get_onnx_providers
+from preface.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class PrefacePredictor(nn.Module):
@@ -199,9 +202,9 @@ def fit_predictor(
 ) -> PrefacePredictor:
     """Dispatch training to either OLM or Rprop neural network."""
     if is_olm:
-        print(f"{log_prefix}Training ordinary linear model ...")
+        logger.info("%sTraining ordinary linear model ...", log_prefix)
         return train_olm(x_train, y_train, device=device)
-    print(f"{log_prefix}Training neural network ...")
+    logger.info("%sTraining neural network ...", log_prefix)
     return train_neural_net(x_train, y_train, hidden=hidden, device=device)
 
 
@@ -230,6 +233,7 @@ def _save_onnx_with_metadata(
     onnx.checker.check_model(onnx_model)
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(onnx_model, str(onnx_path))
+    logger.info("Exported ONNX model to '%s'", onnx_path)
 
 
 def _read_onnx_props(onnx_path: Path, required_keys: set[str]) -> dict[str, str]:

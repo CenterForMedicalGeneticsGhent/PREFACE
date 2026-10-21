@@ -18,6 +18,7 @@ from preface.ffy import (
     run_ffy_single,
 )
 from preface.hardware import configure_hardware, get_onnx_providers, resolve_device
+from preface.logging_utils import LogLevel, configure_logging
 from preface.math_utils import (
     get_m_diff,
     get_sd_diff,
@@ -533,3 +534,53 @@ def test_ffy_cohort_lasso_onnx_and_cli(tmp_path: Path) -> None:
         pearson_cor(df_theoretical["FF"].to_numpy()[:14], np.array(true_ffs[:14]))
         > 0.99
     )
+
+
+def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
+    logger = configure_logging("debug")
+    assert logger.level == 10
+    logger = configure_logging(LogLevel.WARNING)
+    assert logger.level == 30
+    with pytest.raises(ValueError, match="Unsupported log level"):
+        configure_logging("TRACE")
+
+    example_counts = Path(__file__).resolve().parents[1] / "examples" / "counts.bed"
+    res_debug = runner.invoke(
+        app,
+        [
+            "ffy",
+            "--infile",
+            str(example_counts),
+            "--loglevel",
+            "DEBUG",
+        ],
+    )
+    assert res_debug.exit_code == 0
+    assert "gender = M" in res_debug.stdout
+    assert "Single-sample FFY" in res_debug.output
+
+    res_root_err = runner.invoke(
+        app,
+        [
+            "--loglevel",
+            "ERROR",
+            "ffy",
+            "--infile",
+            str(example_counts),
+        ],
+    )
+    assert res_root_err.exit_code == 0
+    assert "gender = M" in res_root_err.stdout
+    assert "Single-sample FFY" not in res_root_err.output
+
+    res_invalid = runner.invoke(
+        app,
+        [
+            "ffy",
+            "--infile",
+            str(example_counts),
+            "--loglevel",
+            "INVALID",
+        ],
+    )
+    assert res_invalid.exit_code != 0

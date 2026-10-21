@@ -18,12 +18,15 @@ import polars as pl
 from preface import EXCLUDE_CHRS
 from preface.hardware import configure_hardware
 from preface.io import NA_VALUES, emit_prediction_output
+from preface.logging_utils import get_logger
 from preface.math_utils import fit_lasso_fista, infer_sex_gmm_1d
 from preface.models import (
     export_ffy_model_to_onnx,
     load_ffy_onnx_metadata,
     run_ffy_onnx_inference,
 )
+
+logger = get_logger(__name__)
 
 AUTOSOME_CHRS: frozenset[str] = frozenset(str(i) for i in range(1, 23)) - EXCLUDE_CHRS
 CHRY_PAR1_END: int = 2_781_479
@@ -434,11 +437,20 @@ def extract_sample_y_profile(
     suffix = input_path.suffix.lower()
     if suffix in ALIGNMENT_SUFFIXES:
         if suffix == ".bam" and importlib.util.find_spec("pysam") is None:
-            return _read_bam_native(input_path, binsize=binsize, mapq=mapq)
-        return _read_alignment_external(
-            input_path, binsize=binsize, mapq=mapq, reference=reference
-        )
-    return _read_binned_counts_bed(input_path)
+            profile = _read_bam_native(input_path, binsize=binsize, mapq=mapq)
+        else:
+            profile = _read_alignment_external(
+                input_path, binsize=binsize, mapq=mapq, reference=reference
+            )
+    else:
+        profile = _read_binned_counts_bed(input_path)
+
+    logger.debug(
+        "Extracted chrY profile from '%s': %d chrY bins",
+        input_path,
+        len(profile.bin_loci),
+    )
+    return profile
 
 
 def _align_profile_to_loci(
@@ -519,6 +531,9 @@ def run_ffy_single(
             float(np.clip(2.0 * y_score * 100.0, 0.0, 100.0)) if gender == "M" else 0.0
         )
 
+    logger.debug(
+        "Single-sample FFY for '%s': gender=%s, FFY=%.4f%%", infile, gender, ffy_pct
+    )
     emit_prediction_output(
         [f"gender = {gender}", f"FFY = {ffy_pct:.4g}%"],
         {"FFY": ffy_pct / 100.0, "gender": gender},
@@ -563,6 +578,7 @@ def run_ffy_cohort(
 
     reads_col = "reads_filepath" if "reads_filepath" in df.columns else "filepath"
     input_paths = [Path(str(p)) for p in df[reads_col].to_list()]
+    logger.info("Extracting chrY profiles for %d cohort samples ...", n_samples)
     first_prof, y_matrix = _load_profiles_matrix(
         input_paths, binsize, mapq, reference, resolved_cpus
     )
@@ -592,6 +608,14 @@ def run_ffy_cohort(
 
     male_mask = np.array([g == "M" for g in genders], dtype=bool)
     female_mask = ~male_mask
+    n_males = int(np.sum(male_mask))
+    n_females = int(np.sum(female_mask))
+    logger.info(
+        "Classified cohort fetal sex: %d male, %d female (threshold=%.6f)",
+        n_males,
+        n_females,
+        learned_thresh,
+    )
 
     info_mask = init_info_mask.copy()
     if np.any(male_mask) and np.any(female_mask):
@@ -602,6 +626,11 @@ def run_ffy_cohort(
             info_mask = refined
 
     info_indices = np.flatnonzero(info_mask).tolist()
+    logger.info(
+        "Selected %d informative chrY bins out of %d total bins",
+        len(info_indices),
+        len(ref_loci),
+    )
     y_scores = np.mean(y_matrix[:, info_mask], axis=1)
 
     if np.any(male_mask) and np.any(female_mask) and yfrac is None:
@@ -614,12 +643,22 @@ def run_ffy_cohort(
     )
 
     if male_ref_paths:
+        logger.info(
+            "Loading %d male reference (LB) sample(s) for 100%% male baseline ...",
+            len(male_ref_paths),
+        )
         _, lb_matrix = _load_profiles_matrix(
             male_ref_paths, binsize, mapq, reference, resolved_cpus, ref_loci
         )
         male_100_baseline = float(np.median(np.mean(lb_matrix[:, info_mask], axis=1)))
     else:
         male_100_baseline = female_baseline + 0.5
+
+    logger.debug(
+        "Calibration baselines: female=%.6f, male_100=%.6f",
+        female_baseline,
+        male_100_baseline,
+    )
 
     denom = max(male_100_baseline - female_baseline, 1e-6)
     prior_ffy = np.zeros(n_samples, dtype=np.float64)
@@ -630,8 +669,14 @@ def run_ffy_cohort(
     x_lasso = np.zeros_like(y_matrix)
     x_lasso[:, info_mask] = y_matrix[:, info_mask]
 
-    if int(np.sum(male_mask)) >= 4 and n_samples >= 4:
+    if n_males >= 4 and n_samples >= 4:
         k_folds = min(10, n_samples)
+        logger.info(
+            "Running %d-fold cross-validated Lasso (lambda=%g) across %d samples ...",
+            k_folds,
+            lasso_lambda,
+            n_samples,
+        )
         perm = rng.permutation(n_samples)
         cv_preds = np.zeros(n_samples, dtype=np.float64)
         for fold in range(k_folds):
@@ -646,6 +691,11 @@ def run_ffy_cohort(
             cv_preds[test_idx] = b0 + x_lasso[test_idx, :] @ w_fold
         final_ffy = np.where(male_mask, np.clip(cv_preds, 0.0, 100.0), 0.0)
     else:
+        logger.warning(
+            "Fewer than 4 male/total samples (%d male, %d total); skipping CV Lasso and using prior FFY.",
+            n_males,
+            n_samples,
+        )
         final_ffy = prior_ffy.copy()
 
     if save_model_path is not None:
@@ -675,6 +725,7 @@ def run_ffy_cohort(
     if outfile is not None:
         outfile.parent.mkdir(parents=True, exist_ok=True)
         outfile.write_text(tsv_text, encoding="utf-8")
+        logger.info("Wrote cohort FFY config (%d samples) to '%s'", n_samples, outfile)
     else:
         print(tsv_text, end="")
 
