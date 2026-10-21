@@ -10,6 +10,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import torch
+from onnx import TensorProto, helper
 from torch import nn
 
 from preface import __version__
@@ -91,6 +92,19 @@ class ONNXModelMetadata:
     the_slope_x: float
     n_feat: int
     is_olm: bool
+    version: str
+
+
+@dataclass(frozen=True)
+class FFYModelMetadata:
+    """Metadata embedded in a saved FFY ONNX model."""
+
+    bin_loci: list[str]
+    informative_indices: list[int]
+    female_baseline: float
+    male_100_baseline: float
+    yfrac_threshold: float
+    binsize: int
     version: str
 
 
@@ -204,6 +218,46 @@ def predict_model(
     return model(x_t).squeeze(-1).cpu().numpy().astype(np.float64)
 
 
+def _save_onnx_with_metadata(
+    onnx_model: onnx.ModelProto,
+    meta_entries: dict[str, str],
+    onnx_path: Path,
+) -> None:
+    for key, val in meta_entries.items():
+        entry = onnx_model.metadata_props.add()
+        entry.key = key
+        entry.value = val
+    onnx.checker.check_model(onnx_model)
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    onnx.save(onnx_model, str(onnx_path))
+
+
+def _read_onnx_props(onnx_path: Path, required_keys: set[str]) -> dict[str, str]:
+    onnx_model = onnx.load(str(onnx_path), load_external_data=False)
+    props = {entry.key: entry.value for entry in onnx_model.metadata_props}
+    missing = required_keys - props.keys()
+    if missing:
+        raise ValueError(
+            f"ONNX model '{onnx_path}' is missing required metadata: {missing}"
+        )
+    return props
+
+
+def _run_single_onnx_tensor(
+    onnx_path: Path,
+    input_name: str,
+    output_name: str,
+    values: np.ndarray,
+    requested_device: str = "auto",
+) -> float:
+    session = ort.InferenceSession(
+        str(onnx_path), providers=get_onnx_providers(requested_device)
+    )
+    input_tensor = np.asarray(values, dtype=np.float32).reshape(1, -1)
+    outputs = session.run([output_name], {input_name: input_tensor})
+    return float(np.asarray(outputs[0]).ravel()[0])
+
+
 def export_pipeline_to_onnx(
     predictor: PrefacePredictor,
     mean_features: np.ndarray,
@@ -242,41 +296,26 @@ def export_pipeline_to_onnx(
     if onnx_program is None:
         raise RuntimeError("ONNX export failed to produce an ONNXProgram.")
 
-    onnx_model = onnx_program.model_proto
-    meta_entries = {
-        "possible_features": json.dumps(possible_features),
-        "the_intercept_X": repr(float(the_intercept_x)),
-        "the_slope_X": repr(float(the_slope_x)),
-        "n_feat": str(cpu_predictor.n_feat),
-        "is_olm": "1" if cpu_predictor.is_olm else "0",
-        "version": __version__,
-    }
-    for key, val in meta_entries.items():
-        entry = onnx_model.metadata_props.add()
-        entry.key = key
-        entry.value = val
-
-    onnx.checker.check_model(onnx_model)
-    onnx.save(onnx_model, str(onnx_path))
+    _save_onnx_with_metadata(
+        onnx_program.model_proto,
+        {
+            "possible_features": json.dumps(possible_features),
+            "the_intercept_X": repr(float(the_intercept_x)),
+            "the_slope_X": repr(float(the_slope_x)),
+            "n_feat": str(cpu_predictor.n_feat),
+            "is_olm": "1" if cpu_predictor.is_olm else "0",
+            "version": __version__,
+        },
+        onnx_path,
+    )
 
 
 def load_onnx_metadata(onnx_path: Path) -> ONNXModelMetadata:
     """Read PREFACE metadata properties from a saved model.onnx file."""
-    onnx_model = onnx.load(str(onnx_path), load_external_data=False)
-    props = {entry.key: entry.value for entry in onnx_model.metadata_props}
-    required_keys = {
-        "possible_features",
-        "the_intercept_X",
-        "the_slope_X",
-        "n_feat",
-        "is_olm",
-    }
-    missing = required_keys - props.keys()
-    if missing:
-        raise ValueError(
-            f"ONNX model '{onnx_path}' is missing required PREFACE metadata: {missing}"
-        )
-
+    props = _read_onnx_props(
+        onnx_path,
+        {"possible_features", "the_intercept_X", "the_slope_X", "n_feat", "is_olm"},
+    )
     return ONNXModelMetadata(
         possible_features=json.loads(props["possible_features"]),
         the_intercept_x=float(props["the_intercept_X"]),
@@ -293,8 +332,113 @@ def run_onnx_inference(
     requested_device: str = "auto",
 ) -> float:
     """Execute ONNX Runtime inference on raw feature ratios (including NaNs)."""
-    providers = get_onnx_providers(requested_device)
-    session = ort.InferenceSession(str(onnx_path), providers=providers)
-    input_tensor = np.asarray(feature_ratios, dtype=np.float32).reshape(1, -1)
-    outputs = session.run(["preface_prediction"], {"ratio": input_tensor})
-    return float(np.asarray(outputs[0]).ravel()[0])
+    return _run_single_onnx_tensor(
+        onnx_path, "ratio", "preface_prediction", feature_ratios, requested_device
+    )
+
+
+def export_ffy_model_to_onnx(
+    intercept: float,
+    weights: np.ndarray,
+    bin_loci: list[str],
+    informative_indices: list[int],
+    female_baseline: float,
+    male_100_baseline: float,
+    yfrac_threshold: float,
+    binsize: int,
+    onnx_path: Path,
+) -> None:
+    """Export a fitted FFY Lasso model and calibration baselines to a self-contained ONNX file."""
+    n_bins = len(bin_loci)
+    w_arr = np.asarray(weights, dtype=np.float32).reshape(n_bins, 1)
+
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["y_norm", "lasso_weights"], ["matmul_out"]),
+            helper.make_node("Add", ["matmul_out", "lasso_intercept"], ["raw_out"]),
+            helper.make_node("Squeeze", ["raw_out", "squeeze_axes"], ["squeezed_out"]),
+            helper.make_node(
+                "Clip", ["squeezed_out", "clip_min", "clip_max"], ["ffy_prediction"]
+            ),
+        ],
+        "PREFACE_FFY_Graph",
+        [
+            helper.make_tensor_value_info(
+                "y_norm", TensorProto.FLOAT, ["batch_size", n_bins]
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "ffy_prediction", TensorProto.FLOAT, ["batch_size"]
+            )
+        ],
+        [
+            helper.make_tensor(
+                "lasso_weights",
+                TensorProto.FLOAT,
+                [n_bins, 1],
+                w_arr.flatten().tolist(),
+            ),
+            helper.make_tensor(
+                "lasso_intercept", TensorProto.FLOAT, [1], [float(intercept)]
+            ),
+            helper.make_tensor("clip_min", TensorProto.FLOAT, [], [0.0]),
+            helper.make_tensor("clip_max", TensorProto.FLOAT, [], [100.0]),
+            helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [1]),
+        ],
+    )
+    onnx_model = helper.make_model(
+        graph, producer_name="preface", opset_imports=[helper.make_opsetid("", 18)]
+    )
+    onnx_model.ir_version = 9
+
+    _save_onnx_with_metadata(
+        onnx_model,
+        {
+            "model_type": "PREFACE_FFY",
+            "bin_loci": json.dumps(bin_loci),
+            "informative_indices": json.dumps(informative_indices),
+            "female_baseline": repr(float(female_baseline)),
+            "male_100_baseline": repr(float(male_100_baseline)),
+            "yfrac_threshold": repr(float(yfrac_threshold)),
+            "binsize": str(binsize),
+            "version": __version__,
+        },
+        onnx_path,
+    )
+
+
+def load_ffy_onnx_metadata(onnx_path: Path) -> FFYModelMetadata:
+    """Read FFY model metadata properties from a saved ONNX file."""
+    props = _read_onnx_props(
+        onnx_path,
+        {
+            "bin_loci",
+            "informative_indices",
+            "female_baseline",
+            "male_100_baseline",
+            "yfrac_threshold",
+            "binsize",
+        },
+    )
+    return FFYModelMetadata(
+        bin_loci=json.loads(props["bin_loci"]),
+        informative_indices=json.loads(props["informative_indices"]),
+        female_baseline=float(props["female_baseline"]),
+        male_100_baseline=float(props["male_100_baseline"]),
+        yfrac_threshold=float(props["yfrac_threshold"]),
+        binsize=int(props["binsize"]),
+        version=props.get("version", __version__),
+    )
+
+
+def run_ffy_onnx_inference(
+    onnx_path: Path,
+    aligned_y: np.ndarray,
+    requested_device: str = "auto",
+) -> float:
+    """Execute ONNX Runtime inference on normalized chromosome Y bin values."""
+    pred = _run_single_onnx_tensor(
+        onnx_path, "y_norm", "ffy_prediction", aligned_y, requested_device
+    )
+    return float(np.clip(pred, 0.0, 100.0))

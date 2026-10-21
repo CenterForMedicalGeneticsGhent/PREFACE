@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,7 +10,12 @@ import numpy as np
 import torch
 
 from preface.hardware import configure_hardware, resolve_device
-from preface.io import load_config, load_inference_bed, load_training_dataset
+from preface.io import (
+    emit_prediction_output,
+    load_config,
+    load_inference_bed,
+    load_training_dataset,
+)
 from preface.math_utils import ols_fit, pca_irlba_torch, rlm_huber
 from preface.models import (
     export_pipeline_to_onnx,
@@ -323,14 +327,9 @@ def run_predict(
         requested_device=device_name,
     )
 
-    json_payload = json.dumps({"FFX": ffx / 100.0, "PREFACE": prediction / 100.0})
-
-    if json_arg is None:
-        print(f"FFX = {ffx:.4g}%")
-        print(f"PREFACE = {prediction:.4g}%")
-    elif json_arg == "":
-        print(json_payload)
-    else:
-        Path(json_arg).write_text(json_payload, encoding="utf-8")
-
+    emit_prediction_output(
+        [f"FFX = {ffx:.4g}%", f"PREFACE = {prediction:.4g}%"],
+        {"FFX": ffx / 100.0, "PREFACE": prediction / 100.0},
+        json_arg,
+    )
     return ffx, prediction

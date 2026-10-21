@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,3 +171,20 @@ def load_inference_bed(bed_path: Path, possible_features: list[str]) -> SampleBe
     )
 
     return SampleBedData(x_ratio=x_ratio, feature_ratios=selected_ratios)
+
+
+def emit_prediction_output(
+    text_lines: list[str],
+    json_dict: dict[str, str | float],
+    json_arg: str | None,
+) -> None:
+    """Write single-sample prediction results as human-readable lines or JSON to stdout/file."""
+    if json_arg is None:
+        for line in text_lines:
+            print(line)
+        return
+    payload = json.dumps(json_dict)
+    if json_arg == "":
+        print(payload)
+    else:
+        Path(json_arg).write_text(payload, encoding="utf-8")

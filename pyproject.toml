@@ -29,6 +29,7 @@ platforms = ["linux-64", "osx-arm64"]
 check = "ruff check --fix"
 format = "ruff format"
 preface = "preface"
+ffy = "preface ffy"
 train = "preface train"
 predict = "preface predict"
 test = "pytest"
