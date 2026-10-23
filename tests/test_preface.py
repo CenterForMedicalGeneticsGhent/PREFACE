@@ -18,6 +18,7 @@ from preface.ffy import (
     run_ffy_single,
 )
 from preface.hardware import configure_hardware, get_onnx_providers, resolve_device
+from preface.io import load_config, load_training_dataset, parallel_load_samples
 from preface.logging_utils import LogLevel, configure_logging
 from preface.math_utils import (
     get_m_diff,
@@ -535,6 +536,24 @@ def test_ffy_cohort_lasso_onnx_and_cli(tmp_path: Path) -> None:
         > 0.99
     )
 
+    reads_only_manifest = tmp_path / "manifest_reads_only.txt"
+    reads_only_rows = ["ID\treads_filepath\tgender"] + [
+        f"ID_{i}\t{(counts_dir / f'sample_{i}.bed').as_posix()}\t{true_genders[i]}"
+        for i in range(n_samples)
+    ]
+    reads_only_manifest.write_text("\n".join(reads_only_rows) + "\n", encoding="utf-8")
+    df_reads_only = run_ffy_cohort(config_path=reads_only_manifest, cpus=1, seed=1)
+    assert df_reads_only.columns == ["ID", "filepath", "gender", "FF"]
+    assert df_reads_only["filepath"].to_list() == [
+        (counts_dir / f"sample_{i}.bed").as_posix() for i in range(n_samples)
+    ]
+    assert np.allclose(df_reads_only["FF"].to_numpy(), df_theoretical["FF"].to_numpy())
+
+    bad_manifest = tmp_path / "bad_manifest.txt"
+    bad_manifest.write_text("ID\tgender\nID_0\tM\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing required column"):
+        run_ffy_cohort(config_path=bad_manifest, cpus=1, seed=1)
+
 
 def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
     logger = configure_logging("debug")
@@ -584,3 +603,31 @@ def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
         ],
     )
     assert res_invalid.exit_code != 0
+
+
+def _square_or_fail_worker(val: int) -> int:
+    if val < 0:
+        raise FileNotFoundError(f"Missing sample {val}")
+    return val * val
+
+
+def test_parallel_load_samples(tmp_path: Path) -> None:
+    assert parallel_load_samples([], _square_or_fail_worker, cpus=2) == []
+
+    items = [(f"S_{i}", i) for i in range(8)]
+    res_seq = parallel_load_samples(items, _square_or_fail_worker, cpus=1)
+    res_par = parallel_load_samples(items, _square_or_fail_worker, cpus=2)
+    assert res_seq == [i * i for i in range(8)]
+    assert res_par == res_seq
+
+    bad_items = [("S_0", 2), ("S_bad", -1), ("S_2", 4)]
+    with pytest.raises(FileNotFoundError, match="Missing sample -1"):
+        parallel_load_samples(bad_items, _square_or_fail_worker, cpus=2)
+
+    config_path, _ = _create_synthetic_cohort(tmp_path, n_samples=8)
+    cfg_df = load_config(config_path, rng=np.random.default_rng(1))
+    ds_1 = load_training_dataset(cfg_df, cpus=1)
+    ds_2 = load_training_dataset(cfg_df, cpus=2)
+    assert ds_1.possible_features == ds_2.possible_features
+    assert np.allclose(ds_1.training_frame, ds_2.training_frame)
+    assert np.allclose(ds_1.x_ratios, ds_2.x_ratios)

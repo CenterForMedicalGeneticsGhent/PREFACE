@@ -7,7 +7,6 @@ import shutil
 import struct
 import subprocess
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -16,15 +15,8 @@ import numpy as np
 import polars as pl
 
 from preface import EXCLUDE_CHRS
-from preface.hardware import configure_hardware
-from preface.io import NA_VALUES, emit_prediction_output
+from preface.io import NA_VALUES, emit_prediction_output, parallel_load_samples
 from preface.logging_utils import get_logger
-from preface.math_utils import fit_lasso_fista, infer_sex_gmm_1d
-from preface.models import (
-    export_ffy_model_to_onnx,
-    load_ffy_onnx_metadata,
-    run_ffy_onnx_inference,
-)
 
 logger = get_logger(__name__)
 
@@ -463,24 +455,13 @@ def _align_profile_to_loci(
     return np.nan_to_num(arr, nan=0.0)
 
 
-def _load_profiles_matrix(
-    paths: list[Path],
-    binsize: int,
-    mapq: int,
-    reference: Path | None,
-    cpus: int,
-    target_loci: list[str] | None = None,
-) -> tuple[SampleYProfile, np.ndarray]:
-    def _load_one(path: Path) -> SampleYProfile:
-        return extract_sample_y_profile(
-            path, binsize=binsize, mapq=mapq, reference=reference
-        )
-
-    with ThreadPoolExecutor(max_workers=max(1, cpus)) as pool:
-        profiles = list(pool.map(_load_one, paths))
-    loci = target_loci if target_loci is not None else profiles[0].bin_loci
-    matrix = np.vstack([_align_profile_to_loci(p, loci) for p in profiles])
-    return profiles[0], matrix
+def _extract_profile_worker(
+    args: tuple[Path, int, int, Path | None],
+) -> SampleYProfile:
+    path, binsize, mapq, reference = args
+    return extract_sample_y_profile(
+        path, binsize=binsize, mapq=mapq, reference=reference
+    )
 
 
 def run_ffy_single(
@@ -494,6 +475,8 @@ def run_ffy_single(
     device_name: str = "auto",
 ) -> tuple[str, float]:
     """Calculate gender and baseline FFY (%) for a single BAM/CRAM/BED sample."""
+    from preface.models import load_ffy_onnx_metadata, run_ffy_onnx_inference
+
     if model_path is not None:
         if not model_path.is_file():
             raise FileNotFoundError(f"The file '{model_path}' does not exist.")
@@ -556,6 +539,10 @@ def run_ffy_cohort(
     seed: int = 1,
 ) -> pl.DataFrame:
     """Calculate baseline FFY and gender across a cohort per PMC6771918 Section 3.4."""
+    from preface.hardware import configure_hardware
+    from preface.math_utils import fit_lasso_fista, infer_sex_gmm_1d
+    from preface.models import export_ffy_model_to_onnx
+
     if not config_path.is_file():
         raise FileNotFoundError(f"The file '{config_path}' does not exist.")
 
@@ -565,8 +552,8 @@ def run_ffy_cohort(
     df = pl.read_csv(
         config_path, separator="\t", null_values=NA_VALUES, infer_schema_length=1000
     )
-    if "ID" not in df.columns and (
-        "filepath" not in df.columns or "reads_filepath" not in df.columns
+    if "ID" not in df.columns or (
+        "filepath" not in df.columns and "reads_filepath" not in df.columns
     ):
         raise ValueError(
             f"Cohort file '{config_path}' is missing required column 'ID' or 'filepath/reads_filepath'."
@@ -577,13 +564,30 @@ def run_ffy_cohort(
         raise ValueError(f"Cohort file '{config_path}' contains no samples.")
 
     reads_col = "reads_filepath" if "reads_filepath" in df.columns else "filepath"
+    sample_ids = [str(s) for s in df["ID"].to_list()]
     input_paths = [Path(str(p)) for p in df[reads_col].to_list()]
-    logger.info("Extracting chrY profiles for %d cohort samples ...", n_samples)
-    first_prof, y_matrix = _load_profiles_matrix(
-        input_paths, binsize, mapq, reference, resolved_cpus
-    )
 
+    combined_items = [
+        (sid, (path, binsize, mapq, reference))
+        for sid, path in zip(sample_ids, input_paths)
+    ]
+    if male_ref_paths:
+        combined_items.extend(
+            (f"male_ref:{p.name}", (p, binsize, mapq, reference))
+            for p in male_ref_paths
+        )
+
+    logger.info("Extracting chrY profiles for %d cohort samples ...", n_samples)
+    all_profiles = parallel_load_samples(
+        combined_items, _extract_profile_worker, cpus=resolved_cpus
+    )
+    cohort_profiles = all_profiles[:n_samples]
+    lb_profiles = all_profiles[n_samples:]
+
+    first_prof = cohort_profiles[0]
     ref_loci = first_prof.bin_loci
+    y_matrix = np.vstack([_align_profile_to_loci(p, ref_loci) for p in cohort_profiles])
+
     coord_mask = _coordinate_informative_mask(
         first_prof.bin_starts, first_prof.bin_ends
     )
@@ -642,13 +646,13 @@ def run_ffy_cohort(
         float(np.median(y_scores[female_mask])) if np.any(female_mask) else 0.0
     )
 
-    if male_ref_paths:
+    if lb_profiles:
         logger.info(
-            "Loading %d male reference (LB) sample(s) for 100%% male baseline ...",
-            len(male_ref_paths),
+            "Using %d male reference (LB) sample(s) for 100%% male baseline ...",
+            len(lb_profiles),
         )
-        _, lb_matrix = _load_profiles_matrix(
-            male_ref_paths, binsize, mapq, reference, resolved_cpus, ref_loci
+        lb_matrix = np.vstack(
+            [_align_profile_to_loci(p, ref_loci) for p in lb_profiles]
         )
         male_100_baseline = float(np.median(np.mean(lb_matrix[:, info_mask], axis=1)))
     else:
@@ -712,10 +716,11 @@ def run_ffy_cohort(
             onnx_path=save_model_path,
         )
 
+    out_path_col = "filepath" if "filepath" in df.columns else reads_col
     out_df = pl.DataFrame(
         {
             "ID": df["ID"].cast(pl.String),
-            "filepath": df["filepath"].cast(pl.String),
+            "filepath": df[out_path_col].cast(pl.String),
             "gender": genders,
             "FF": final_ffy,
         }

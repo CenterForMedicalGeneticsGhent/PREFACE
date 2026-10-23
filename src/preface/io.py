@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+import os
+from collections.abc import Callable, Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,13 +90,81 @@ def _read_bed_table(bed_path: Path) -> pl.DataFrame:
     )
 
 
-def _load_single_sample_ratios(args: tuple[int, int, str, str]) -> np.ndarray:
-    idx, total, sample_id, filepath = args
-    logger.info(
-        "Loading sample %s | %d/%d remaining ...", sample_id, total - (idx + 1), total
-    )
+def _init_loader_worker() -> None:
+    """Restrict per-worker thread pools to prevent oversubscription across processes."""
+    os.environ["POLARS_MAX_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+
+def parallel_load_samples[T, R](
+    items: Sequence[tuple[str, T]],
+    worker_fn: Callable[[T], R],
+    cpus: int,
+) -> list[R]:
+    """Load sample files in parallel across worker processes while preserving input order."""
+    total = len(items)
+    if total == 0:
+        return []
+
+    max_workers = min(max(1, cpus), total)
+    if max_workers == 1:
+        results: list[R] = []
+        for done_count, (sample_id, payload) in enumerate(items, start=1):
+            logger.info(
+                "Loading sample %s | %d/%d remaining ...",
+                sample_id,
+                total - done_count,
+                total,
+            )
+            results.append(worker_fn(payload))
+        return results
+
+    ordered_results: dict[int, R] = {}
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_loader_worker,
+    ) as pool:
+        future_to_meta = {
+            pool.submit(worker_fn, payload): (idx, sample_id)
+            for idx, (sample_id, payload) in enumerate(items)
+        }
+        done_count = 0
+        try:
+            for future in as_completed(future_to_meta):
+                idx, sample_id = future_to_meta[future]
+                ordered_results[idx] = future.result()
+                done_count += 1
+                logger.info(
+                    "Loading sample %s | %d/%d remaining ...",
+                    sample_id,
+                    total - done_count,
+                    total,
+                )
+        except Exception:
+            for pending in future_to_meta:
+                pending.cancel()
+            raise
+
+    return [ordered_results[i] for i in range(total)]
+
+
+def _load_single_sample_bed(
+    args: tuple[str, bool],
+) -> tuple[np.ndarray, list[str] | None, list[str] | None]:
+    filepath, include_meta = args
     df = _read_bed_table(Path(filepath)).filter(pl.col("chr") != "Y")
-    return df["ratio"].to_numpy().astype(np.float64, copy=False)
+    ratios = df["ratio"].to_numpy().astype(np.float64, copy=False)
+    if not include_meta:
+        return ratios, None, None
+
+    excluded = list(EXCLUDE_CHRS)
+    chrs = df["chr"].to_list()
+    feature_loci = (
+        df.filter(~pl.col("chr").is_in(excluded))
+        .select(_locus_id_expr().alias("locus"))["locus"]
+        .to_list()
+    )
+    return ratios, chrs, feature_loci
 
 
 def load_training_dataset(
@@ -103,32 +173,29 @@ def load_training_dataset(
 ) -> TrainingDataset:
     """Load all training BED files concurrently, compute X ratios, filter NAs, and mean-impute."""
     n_samples = config_df.height
-    ref_df = _read_bed_table(Path(config_df["filepath"][0])).filter(
-        pl.col("chr") != "Y"
-    )
-
-    tasks = [
-        (i, n_samples, str(config_df["ID"][i]), str(config_df["filepath"][i]))
+    items = [
+        (
+            str(config_df["ID"][i]),
+            (str(config_df["filepath"][i]), i == 0),
+        )
         for i in range(n_samples)
     ]
-    with ThreadPoolExecutor(max_workers=max(1, cpus)) as pool:
-        sample_columns = list(pool.map(_load_single_sample_ratios, tasks))
+    loaded = parallel_load_samples(items, _load_single_sample_bed, cpus=cpus)
+
+    sample_columns = [r for r, _, _ in loaded]
+    ref_chrs = loaded[0][1]
+    feature_names_all = loaded[0][2]
+    assert ref_chrs is not None and feature_names_all is not None
 
     sub_matrix = np.column_stack(sample_columns)
 
-    x_mask = (ref_df["chr"] == "X").to_numpy()
+    x_mask = np.array([c == "X" for c in ref_chrs], dtype=bool)
     with np.errstate(invalid="ignore"):
         x_ratios = np.power(2.0, np.nanmean(sub_matrix[x_mask, :], axis=0))
 
     logger.info("Creating training frame ...")
 
-    excluded = list(EXCLUDE_CHRS)
-    keep_chr_mask = (~ref_df["chr"].is_in(excluded)).to_numpy()
-    feature_names_all = (
-        ref_df.filter(~pl.col("chr").is_in(excluded))
-        .select(_locus_id_expr().alias("locus"))["locus"]
-        .to_list()
-    )
+    keep_chr_mask = np.array([c not in EXCLUDE_CHRS for c in ref_chrs], dtype=bool)
 
     training_frame = np.ascontiguousarray(
         sub_matrix[keep_chr_mask, :].T, dtype=np.float64

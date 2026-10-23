@@ -35,6 +35,7 @@ predict = "preface predict"
 test = "pytest"
 docker-build = "docker build --platform linux/amd64 -t quay.io/cmgg/preface:dev ."
 docker-push = "docker push quay.io/cmgg/preface:dev"
+docker-build-push = "docker build --platform linux/amd64 -t quay.io/cmgg/preface:dev . && docker push quay.io/cmgg/preface:dev"
 
 [tool.pixi.dependencies]
 python = ">=3.14"

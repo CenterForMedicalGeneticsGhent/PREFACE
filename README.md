@@ -90,9 +90,9 @@ For training, PREFACE requires a config file.
 pixi run preface ffy --config path/to/manifest.txt --outfile path/to/config.txt [optional arguments]
 ```
 
-The input `--config` manifest is a tab-separated file with required columns `ID` and `filepath`, plus optional columns `reads_filepath` and `gender`:
-- If `reads_filepath` is present, `preface ffy` reads the `.bam`/`.cram` or binned read count `.bed` file (such as `./examples/counts.bed`) from `reads_filepath` while keeping `filepath` (the copy number alteration `.bed` file for `preface train`, such as `./examples/infile.bed`) unchanged in the output `config.txt`.
-- If `reads_filepath` is omitted, `preface ffy` reads the counts or alignments directly from `filepath`.
+The input `--config` manifest is a tab-separated file with required column `ID` and at least one of `filepath` or `reads_filepath`, plus optional column `gender`:
+- If both `reads_filepath` and `filepath` are present, `preface ffy` reads the `.bam`/`.cram` or binned read count `.bed` file (such as `./examples/counts.bed`) from `reads_filepath` while keeping `filepath` (the copy number alteration `.bed` file for `preface train`, such as `./examples/infile.bed`) unchanged in the output `config.txt`.
+- If only `reads_filepath` or only `filepath` is present, `preface ffy` reads the counts or alignments from that column and writes it to the `filepath` column of the output `config.txt`.
 - If `gender` (`M` or `F`) is omitted or `NA`, `preface ffy` fills it in automatically.
 
 ### Single-sample mode
