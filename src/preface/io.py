@@ -79,6 +79,7 @@ def _read_bed_table(bed_path: Path) -> pl.DataFrame:
     return pl.read_csv(
         bed_path,
         separator="\t",
+        comment_char="#",
         null_values=NA_VALUES,
         schema_overrides={
             "chr": pl.String,
