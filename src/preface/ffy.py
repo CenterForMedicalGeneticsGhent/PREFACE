@@ -15,7 +15,12 @@ import numpy as np
 import polars as pl
 
 from preface import EXCLUDE_CHRS
-from preface.io import NA_VALUES, emit_prediction_output, parallel_load_samples
+from preface.io import (
+    NA_VALUES,
+    emit_prediction_output,
+    open_text_file,
+    parallel_load_samples,
+)
 from preface.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -116,7 +121,7 @@ def _read_binned_counts_bed(bed_path: Path) -> SampleYProfile:
     """Parse a headered or headerless 4-column binned read count BED/TSV file."""
     first_data_line = ""
     skip_lines = 0
-    with bed_path.open("r", encoding="utf-8") as fh:
+    with open_text_file(bed_path) as fh:
         for line in fh:
             stripped = line.strip()
             if not stripped:

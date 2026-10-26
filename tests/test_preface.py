@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 
@@ -665,3 +666,25 @@ def test_read_bed_table_commented_headers(tmp_path: Path) -> None:
     prof = extract_sample_y_profile(ffy_bed)
     assert prof.bin_loci == ["Y:3000001-3005000"]
     assert len(prof.y_norm_bins) == 1
+
+    # Test gzip compressed bed file with commented header and metadata
+    gz_bed = tmp_path / "sample_commented.bed.gz"
+    gz_content = gzip.compress(
+        b"##track name=sample\n# date=2026-10-26\n#chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n"
+    )
+    gz_bed.write_bytes(gz_content)
+    df_gz = _read_bed_table(gz_bed)
+    assert df_gz.columns == ["chr", "start", "end", "ratio"]
+    assert df_gz.height == 2
+    assert df_gz["chr"].to_list() == ["1", "X"]
+
+    # Test gzip compressed FFY bed file
+    gz_ffy = tmp_path / "ffy_commented.bed.gz"
+    gz_ffy.write_bytes(
+        gzip.compress(
+            b"##fileformat=bed\n# date=2026\n#chr\tstart\tend\tcount\n1\t1000001\t1005000\t500\nY\t3000001\t3005000\t100\n"
+        )
+    )
+    prof_gz = extract_sample_y_profile(gz_ffy)
+    assert prof_gz.bin_loci == ["Y:3000001-3005000"]
+    assert len(prof_gz.y_norm_bins) == 1

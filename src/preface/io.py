@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 import numpy as np
 import polars as pl
@@ -87,9 +89,17 @@ def _normalize_bed_col(col_name: str) -> str:
     return cleaned
 
 
+def open_text_file(path: Path) -> TextIO:
+    with path.open("rb") as f:
+        magic = f.read(2)
+    if magic == b"\x1f\x8b":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
+
+
 def _count_leading_comment_lines(bed_path: Path) -> int:
     skip = 0
-    with bed_path.open("r", encoding="utf-8") as f:
+    with open_text_file(bed_path) as f:
         for line in f:
             stripped = line.strip()
             if not stripped:
