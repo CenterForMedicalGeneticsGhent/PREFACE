@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -158,3 +159,123 @@ def rlm_huber(
     sst = float(np.sum(weights * ((observed - w_mean) ** 2)))
     r2 = max(0.0, 1.0 - sse / sst) if sst > 0 else 0.0
     return float(coeffs[0]), float(coeffs[1]), float(np.sqrt(r2))
+
+
+def infer_sex_gmm_1d(
+    y_scores: np.ndarray,
+    yfrac: float | None = None,
+    fallback_threshold: float = 0.01,
+) -> tuple[list[str], float]:
+    """Classify samples into female ('F') and male ('M') via explicit threshold or 1D 2-GMM."""
+    scores = np.asarray(y_scores, dtype=np.float64).ravel()
+    if yfrac is not None:
+        thresh = float(yfrac)
+        return ["M" if float(s) >= thresh else "F" for s in scores], thresh
+    if scores.size < 2 or float(np.max(scores) - np.min(scores)) < 1e-4:
+        return [
+            "M" if float(s) >= fallback_threshold else "F" for s in scores
+        ], fallback_threshold
+
+    mu0 = float(np.percentile(scores, 20))
+    mu1 = float(np.percentile(scores, 80))
+    if mu1 - mu0 < 1e-4:
+        mu0, mu1 = float(np.min(scores)), float(np.max(scores))
+
+    var0 = max(float(np.var(scores)) * 0.25, 1e-6)
+    var1 = max(float(np.var(scores)) * 0.50, 1e-6)
+    pi0 = 0.5
+
+    for _ in range(100):
+        prev_mu0, prev_mu1 = mu0, mu1
+        p0 = pi0 * np.exp(-0.5 * ((scores - mu0) ** 2) / var0) / math.sqrt(var0)
+        p1 = (1.0 - pi0) * np.exp(-0.5 * ((scores - mu1) ** 2) / var1) / math.sqrt(var1)
+        denom = np.maximum(p0 + p1, 1e-300)
+        gamma1 = p1 / denom
+        gamma0 = 1.0 - gamma1
+
+        n0 = float(np.sum(gamma0))
+        n1 = float(np.sum(gamma1))
+        if n0 < 1e-3 or n1 < 1e-3:
+            break
+
+        pi0 = float(np.clip(n0 / scores.size, 0.05, 0.95))
+        mu0 = float(np.sum(gamma0 * scores) / n0)
+        mu1 = float(np.sum(gamma1 * scores) / n1)
+        var0 = max(float(np.sum(gamma0 * ((scores - mu0) ** 2)) / n0), 1e-6)
+        var1 = max(float(np.sum(gamma1 * ((scores - mu1) ** 2)) / n1), 1e-6)
+
+        if abs(mu0 - prev_mu0) < 1e-7 and abs(mu1 - prev_mu1) < 1e-7:
+            break
+
+    if mu0 > mu1:
+        mu0, mu1 = mu1, mu0
+        var0, var1 = var1, var0
+        pi0 = 1.0 - pi0
+
+    if mu1 - mu0 < 0.005:
+        return [
+            "M" if float(s) >= fallback_threshold else "F" for s in scores
+        ], fallback_threshold
+
+    grid = np.linspace(mu0, mu1, 500)
+    d0 = pi0 * np.exp(-0.5 * ((grid - mu0) ** 2) / var0) / math.sqrt(var0)
+    d1 = (1.0 - pi0) * np.exp(-0.5 * ((grid - mu1) ** 2) / var1) / math.sqrt(var1)
+    threshold = float(grid[int(np.argmin(np.abs(d0 - d1)))])
+    return ["M" if float(s) >= threshold else "F" for s in scores], threshold
+
+
+def fit_lasso_fista(
+    x_mat: np.ndarray,
+    y_prior_pct: np.ndarray,
+    lam: float = 1e-4,
+    max_iter: int = 500,
+    tol: float = 1e-6,
+) -> tuple[float, np.ndarray]:
+    """Fit non-negative Lasso regression on standardized chrY bins matching PMC6771918 Eq. 3."""
+    n_samples, n_bins = x_mat.shape
+    y_frac = np.asarray(y_prior_pct, dtype=np.float64).ravel() / 100.0
+    y_mean = float(np.mean(y_frac))
+    y_centered = y_frac - y_mean
+
+    x_clean = np.nan_to_num(x_mat, nan=0.0)
+    x_mean = np.mean(x_clean, axis=0)
+    x_std_dev = np.std(x_clean, axis=0)
+    active = x_std_dev > 1e-8
+
+    if not np.any(active) or float(np.std(y_frac)) < 1e-8:
+        return y_mean * 100.0, np.zeros(n_bins, dtype=np.float64)
+
+    x_act = (x_clean[:, active] - x_mean[active]) / x_std_dev[active]
+    m_active = int(np.sum(active))
+
+    v = np.ones(m_active, dtype=np.float64) / math.sqrt(m_active)
+    for _ in range(15):
+        v_next = x_act.T @ (x_act @ v)
+        norm_v = float(np.linalg.norm(v_next))
+        if norm_v <= 1e-12:
+            break
+        v = v_next / norm_v
+    lipschitz = max(float(np.sum((x_act @ v) ** 2)) / max(1, n_samples), 1e-6)
+    step = 1.0 / lipschitz
+    effective_lam = lam * max(1.0, math.sqrt(m_active / max(1, n_samples)))
+
+    beta = np.zeros(m_active, dtype=np.float64)
+    z = np.zeros(m_active, dtype=np.float64)
+    t = 1.0
+
+    for _ in range(max_iter):
+        grad = (x_act.T @ (x_act @ z - y_centered)) / n_samples
+        beta_next = np.maximum(0.0, z - step * grad - step * effective_lam)
+        max_diff = float(np.max(np.abs(beta_next - beta)))
+        t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+        z = beta_next + ((t - 1.0) / t_next) * (beta_next - beta)
+        beta = beta_next
+        t = t_next
+        if max_diff < tol:
+            break
+
+    scaled_beta = beta / x_std_dev[active]
+    intercept_pct = (y_mean - float(np.dot(x_mean[active], scaled_beta))) * 100.0
+    full_weights = np.zeros(n_bins, dtype=np.float64)
+    full_weights[active] = scaled_beta * 100.0
+    return intercept_pct, full_weights

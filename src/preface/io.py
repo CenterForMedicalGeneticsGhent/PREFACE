@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from collections.abc import Callable, Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +13,9 @@ import numpy as np
 import polars as pl
 
 from preface import EXCLUDE_CHRS
+from preface.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 REQUIRED_CONFIG_COLS: tuple[str, ...] = ("ID", "filepath", "gender", "FF")
 REQUIRED_BED_COLS: tuple[str, ...] = ("chr", "start", "end", "ratio")
@@ -67,12 +73,46 @@ def load_config(config_path: Path, rng: np.random.Generator) -> pl.DataFrame:
     return df[rng.permutation(df.height)]
 
 
+def _normalize_bed_col(col_name: str) -> str:
+    cleaned = col_name.lstrip("#").strip()
+    lower = cleaned.lower()
+    if lower in ("chr", "chrom", "chromosome"):
+        return "chr"
+    if lower in ("start", "chromstart"):
+        return "start"
+    if lower in ("end", "chromend"):
+        return "end"
+    if lower in ("ratio", "log2", "copynumber"):
+        return "ratio"
+    return cleaned
+
+
+def _count_leading_comment_lines(bed_path: Path) -> int:
+    skip = 0
+    with bed_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                skip += 1
+                continue
+            if stripped.startswith("#"):
+                clean = stripped.lstrip("#").strip().lower()
+                if clean.startswith(("chr", "chrom", "chromosome")):
+                    break
+                skip += 1
+            else:
+                break
+    return skip
+
+
 def _read_bed_table(bed_path: Path) -> pl.DataFrame:
     if not bed_path.is_file():
         raise FileNotFoundError(f"The file '{bed_path}' does not exist.")
+    skip_lines = _count_leading_comment_lines(bed_path)
     return pl.read_csv(
         bed_path,
         separator="\t",
+        skip_lines=skip_lines,
         null_values=NA_VALUES,
         schema_overrides={
             "chr": pl.String,
@@ -80,15 +120,86 @@ def _read_bed_table(bed_path: Path) -> pl.DataFrame:
             "end": pl.Int64,
             "ratio": pl.Float64,
         },
+        with_column_names=lambda cols: [_normalize_bed_col(c) for c in cols],
         columns=list(REQUIRED_BED_COLS),
     )
 
 
-def _load_single_sample_ratios(args: tuple[int, int, str, str]) -> np.ndarray:
-    idx, total, sample_id, filepath = args
-    print(f"Loading sample {sample_id} | {total - (idx + 1)}/{total} remaining ...")
+def _init_loader_worker() -> None:
+    """Restrict per-worker thread pools to prevent oversubscription across processes."""
+    os.environ["POLARS_MAX_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+
+def parallel_load_samples[T, R](
+    items: Sequence[tuple[str, T]],
+    worker_fn: Callable[[T], R],
+    cpus: int,
+) -> list[R]:
+    """Load sample files in parallel across worker processes while preserving input order."""
+    total = len(items)
+    if total == 0:
+        return []
+
+    max_workers = min(max(1, cpus), total)
+    if max_workers == 1:
+        results: list[R] = []
+        for done_count, (sample_id, payload) in enumerate(items, start=1):
+            logger.info(
+                "Loading sample %s | %d/%d remaining ...",
+                sample_id,
+                total - done_count,
+                total,
+            )
+            results.append(worker_fn(payload))
+        return results
+
+    ordered_results: dict[int, R] = {}
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_loader_worker,
+    ) as pool:
+        future_to_meta = {
+            pool.submit(worker_fn, payload): (idx, sample_id)
+            for idx, (sample_id, payload) in enumerate(items)
+        }
+        done_count = 0
+        try:
+            for future in as_completed(future_to_meta):
+                idx, sample_id = future_to_meta[future]
+                ordered_results[idx] = future.result()
+                done_count += 1
+                logger.info(
+                    "Loading sample %s | %d/%d remaining ...",
+                    sample_id,
+                    total - done_count,
+                    total,
+                )
+        except Exception:
+            for pending in future_to_meta:
+                pending.cancel()
+            raise
+
+    return [ordered_results[i] for i in range(total)]
+
+
+def _load_single_sample_bed(
+    args: tuple[str, bool],
+) -> tuple[np.ndarray, list[str] | None, list[str] | None]:
+    filepath, include_meta = args
     df = _read_bed_table(Path(filepath)).filter(pl.col("chr") != "Y")
-    return df["ratio"].to_numpy().astype(np.float64, copy=False)
+    ratios = df["ratio"].to_numpy().astype(np.float64, copy=False)
+    if not include_meta:
+        return ratios, None, None
+
+    excluded = list(EXCLUDE_CHRS)
+    chrs = df["chr"].to_list()
+    feature_loci = (
+        df.filter(~pl.col("chr").is_in(excluded))
+        .select(_locus_id_expr().alias("locus"))["locus"]
+        .to_list()
+    )
+    return ratios, chrs, feature_loci
 
 
 def load_training_dataset(
@@ -97,32 +208,29 @@ def load_training_dataset(
 ) -> TrainingDataset:
     """Load all training BED files concurrently, compute X ratios, filter NAs, and mean-impute."""
     n_samples = config_df.height
-    ref_df = _read_bed_table(Path(config_df["filepath"][0])).filter(
-        pl.col("chr") != "Y"
-    )
-
-    tasks = [
-        (i, n_samples, str(config_df["ID"][i]), str(config_df["filepath"][i]))
+    items = [
+        (
+            str(config_df["ID"][i]),
+            (str(config_df["filepath"][i]), i == 0),
+        )
         for i in range(n_samples)
     ]
-    with ThreadPoolExecutor(max_workers=max(1, cpus)) as pool:
-        sample_columns = list(pool.map(_load_single_sample_ratios, tasks))
+    loaded = parallel_load_samples(items, _load_single_sample_bed, cpus=cpus)
+
+    sample_columns = [r for r, _, _ in loaded]
+    ref_chrs = loaded[0][1]
+    feature_names_all = loaded[0][2]
+    assert ref_chrs is not None and feature_names_all is not None
 
     sub_matrix = np.column_stack(sample_columns)
 
-    x_mask = (ref_df["chr"] == "X").to_numpy()
+    x_mask = np.array([c == "X" for c in ref_chrs], dtype=bool)
     with np.errstate(invalid="ignore"):
         x_ratios = np.power(2.0, np.nanmean(sub_matrix[x_mask, :], axis=0))
 
-    print("Creating training frame ...")
+    logger.info("Creating training frame ...")
 
-    excluded = list(EXCLUDE_CHRS)
-    keep_chr_mask = (~ref_df["chr"].is_in(excluded)).to_numpy()
-    feature_names_all = (
-        ref_df.filter(~pl.col("chr").is_in(excluded))
-        .select(_locus_id_expr().alias("locus"))["locus"]
-        .to_list()
-    )
+    keep_chr_mask = np.array([c not in EXCLUDE_CHRS for c in ref_chrs], dtype=bool)
 
     training_frame = np.ascontiguousarray(
         sub_matrix[keep_chr_mask, :].T, dtype=np.float64
@@ -139,7 +247,9 @@ def load_training_dataset(
     if na_cols.size > 0:
         training_frame[na_rows, na_cols] = mean_features[na_cols]
 
-    print(f"Remaining training features after 'NA' filtering: {len(possible_features)}")
+    logger.info(
+        "Remaining training features after 'NA' filtering: %d", len(possible_features)
+    )
 
     return TrainingDataset(
         config_df=config_df,
@@ -170,3 +280,20 @@ def load_inference_bed(bed_path: Path, possible_features: list[str]) -> SampleBe
     )
 
     return SampleBedData(x_ratio=x_ratio, feature_ratios=selected_ratios)
+
+
+def emit_prediction_output(
+    text_lines: list[str],
+    json_dict: dict[str, str | float],
+    json_arg: str | None,
+) -> None:
+    """Write single-sample prediction results as human-readable lines or JSON to stdout/file."""
+    if json_arg is None:
+        for line in text_lines:
+            print(line)
+        return
+    payload = json.dumps(json_dict)
+    if json_arg == "":
+        print(payload)
+    else:
+        Path(json_arg).write_text(payload, encoding="utf-8")
