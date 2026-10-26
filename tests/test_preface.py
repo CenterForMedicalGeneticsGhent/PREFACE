@@ -18,7 +18,12 @@ from preface.ffy import (
     run_ffy_single,
 )
 from preface.hardware import configure_hardware, get_onnx_providers, resolve_device
-from preface.io import load_config, load_training_dataset, parallel_load_samples
+from preface.io import (
+    _read_bed_table,
+    load_config,
+    load_training_dataset,
+    parallel_load_samples,
+)
 from preface.logging_utils import LogLevel, configure_logging
 from preface.math_utils import (
     get_m_diff,
@@ -631,3 +636,32 @@ def test_parallel_load_samples(tmp_path: Path) -> None:
     assert ds_1.possible_features == ds_2.possible_features
     assert np.allclose(ds_1.training_frame, ds_2.training_frame)
     assert np.allclose(ds_1.x_ratios, ds_2.x_ratios)
+
+
+def test_read_bed_table_commented_headers(tmp_path: Path) -> None:
+    cases = {
+        "standard": "chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
+        "commented": "#chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
+        "commented_spaced": "# chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
+        "metadata_preceding": "##track name=sample\n# date=2026-10-26\n#chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
+        "aliases_extra_cols": "##track\n#chrom\tchromStart\tchromEnd\tratio\textra\n1\t100\t200\t0.5\tfoo\nX\t200\t300\t1.1\tbar\n",
+    }
+    for name, content in cases.items():
+        bed_file = tmp_path / f"{name}.bed"
+        bed_file.write_text(content)
+        df = _read_bed_table(bed_file)
+        assert df.columns == ["chr", "start", "end", "ratio"]
+        assert df.height == 2
+        assert df["chr"].to_list() == ["1", "X"]
+        assert df["start"].to_list() == [100, 200]
+        assert df["end"].to_list() == [200, 300]
+        assert df["ratio"].to_list() == [0.5, 1.1]
+
+    # Test FFY reader with metadata comments and commented header
+    ffy_bed = tmp_path / "ffy_commented.bed"
+    ffy_bed.write_text(
+        "##fileformat=bed\n# date=2026\n#chr\tstart\tend\tcount\n1\t1000001\t1005000\t500\nY\t3000001\t3005000\t100\n"
+    )
+    prof = extract_sample_y_profile(ffy_bed)
+    assert prof.bin_loci == ["Y:3000001-3005000"]
+    assert len(prof.y_norm_bins) == 1

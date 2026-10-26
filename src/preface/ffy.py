@@ -115,12 +115,19 @@ def _pick_col(
 def _read_binned_counts_bed(bed_path: Path) -> SampleYProfile:
     """Parse a headered or headerless 4-column binned read count BED/TSV file."""
     first_data_line = ""
+    skip_lines = 0
     with bed_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             stripped = line.strip()
-            if not stripped or (
-                stripped.startswith("#") and not stripped.lower().startswith("#chr")
-            ):
+            if not stripped:
+                skip_lines += 1
+                continue
+            if stripped.startswith("#"):
+                clean = stripped.lstrip("#").strip().lower()
+                if clean.startswith(("chr", "chrom", "chromosome")):
+                    first_data_line = stripped
+                    break
+                skip_lines += 1
                 continue
             first_data_line = stripped
             break
@@ -146,6 +153,7 @@ def _read_binned_counts_bed(bed_path: Path) -> SampleYProfile:
     df = pl.read_csv(
         bed_path,
         separator="\t",
+        skip_lines=skip_lines,
         has_header=has_header,
         null_values=NA_VALUES,
         infer_schema_length=1000,

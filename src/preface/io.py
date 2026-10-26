@@ -73,13 +73,46 @@ def load_config(config_path: Path, rng: np.random.Generator) -> pl.DataFrame:
     return df[rng.permutation(df.height)]
 
 
+def _normalize_bed_col(col_name: str) -> str:
+    cleaned = col_name.lstrip("#").strip()
+    lower = cleaned.lower()
+    if lower in ("chr", "chrom", "chromosome"):
+        return "chr"
+    if lower in ("start", "chromstart"):
+        return "start"
+    if lower in ("end", "chromend"):
+        return "end"
+    if lower in ("ratio", "log2", "copynumber"):
+        return "ratio"
+    return cleaned
+
+
+def _count_leading_comment_lines(bed_path: Path) -> int:
+    skip = 0
+    with bed_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                skip += 1
+                continue
+            if stripped.startswith("#"):
+                clean = stripped.lstrip("#").strip().lower()
+                if clean.startswith(("chr", "chrom", "chromosome")):
+                    break
+                skip += 1
+            else:
+                break
+    return skip
+
+
 def _read_bed_table(bed_path: Path) -> pl.DataFrame:
     if not bed_path.is_file():
         raise FileNotFoundError(f"The file '{bed_path}' does not exist.")
+    skip_lines = _count_leading_comment_lines(bed_path)
     return pl.read_csv(
         bed_path,
         separator="\t",
-        comment_char="#",
+        skip_lines=skip_lines,
         null_values=NA_VALUES,
         schema_overrides={
             "chr": pl.String,
@@ -87,6 +120,7 @@ def _read_bed_table(bed_path: Path) -> pl.DataFrame:
             "end": pl.Int64,
             "ratio": pl.Float64,
         },
+        with_column_names=lambda cols: [_normalize_bed_col(c) for c in cols],
         columns=list(REQUIRED_BED_COLS),
     )
 
