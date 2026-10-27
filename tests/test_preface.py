@@ -1,29 +1,32 @@
-"""Unit and integration tests for the PREFACE Python rewrite."""
+"""Unit and integration tests for PREFACE."""
 
 from __future__ import annotations
 
-import gzip
 import json
+import struct
+import zlib
 from pathlib import Path
 
 import numpy as np
-import polars as pl
 import pytest
 import torch
+import yaml
 from typer.testing import CliRunner
 
 from preface.cli import _normalize_argv, app
 from preface.ffy import (
     extract_sample_y_profile,
-    run_ffy_cohort,
     run_ffy_single,
 )
 from preface.hardware import configure_hardware, get_onnx_providers, resolve_device
 from preface.io import (
-    _read_bed_table,
-    load_config,
+    FFY_TARGET_CHRS,
+    _read_bam_native,
+    load_samplesheet,
     load_training_dataset,
     parallel_load_samples,
+    validate_samplesheet_data,
+    write_samplesheet,
 )
 from preface.logging_utils import LogLevel, configure_logging
 from preface.math_utils import (
@@ -46,6 +49,78 @@ from preface.models import (
 from preface.pipeline import run_predict, run_train
 
 runner = CliRunner()
+
+
+def _make_bgzf_block(payload: bytes) -> bytes:
+    """Wrap uncompressed bytes into a valid BGZF block."""
+    comp_obj = zlib.compressobj(level=6, method=zlib.DEFLATED, wbits=-zlib.MAX_WBITS)
+    cdata = comp_obj.compress(payload) + comp_obj.flush()
+    bsize = 12 + 6 + len(cdata) + 8 - 1
+    header = struct.pack(
+        "<BBBBIBBHBBHH",
+        0x1F,
+        0x8B,
+        8,
+        0x04,
+        0,
+        0,
+        0xFF,
+        6,
+        66,
+        67,
+        2,
+        bsize,
+    )
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    trailer = struct.pack("<II", crc, len(payload))
+    return header + cdata + trailer
+
+
+def _write_synthetic_bam_from_bin_counts(
+    bam_path: Path,
+    refs: list[tuple[str, int]],
+    bin_reads: list[tuple[int, int, int, int, int]],
+) -> None:
+    """Write a valid BGZF-compressed BAM file from (ref_id, pos0, mapq, flag, count) tuples."""
+    parts: list[bytes] = [b"BAM\x01", struct.pack("<i", 0)]
+    parts.append(struct.pack("<i", len(refs)))
+    for name, length in refs:
+        name_b = name.encode("ascii") + b"\x00"
+        parts.append(
+            struct.pack("<i", len(name_b)) + name_b + struct.pack("<i", length)
+        )
+
+    qname = b"r\x00"
+    for ref_id, pos0, mapq, flag, count in bin_reads:
+        if count <= 0:
+            continue
+        rec_body = (
+            struct.pack(
+                "<iiBBHHHiiii",
+                ref_id,
+                pos0,
+                len(qname),
+                mapq,
+                4680,
+                0,
+                flag,
+                0,
+                -1,
+                -1,
+                0,
+            )
+            + qname
+        )
+        rec = struct.pack("<i", len(rec_body)) + rec_body
+        parts.append(rec * count)
+
+    uncompressed = b"".join(parts)
+    blocks: list[bytes] = []
+    chunk_size = 60_000
+    for idx in range(0, len(uncompressed), chunk_size):
+        blocks.append(_make_bgzf_block(uncompressed[idx : idx + chunk_size]))
+    blocks.append(_make_bgzf_block(b""))
+    bam_path.write_bytes(b"".join(blocks))
 
 
 def test_hardware_resolution() -> None:
@@ -72,23 +147,22 @@ def test_math_utils_pca_ols_rlm() -> None:
     assert np.all(np.diff(pca_res.importance_prop) <= 1e-12)
     assert 0.0 < float(np.sum(pca_res.importance_prop)) <= 1.0 + 1e-6
 
-    t = np.linspace(1.0, 20.0, 40)
-    y = 3.5 + 2.2 * t
+    t = np.linspace(0.01, 0.20, 40)
+    y = 0.035 + 2.2 * t
     intercept, slope = ols_fit(t, y)
-    assert np.isclose(intercept, 3.5)
+    assert np.isclose(intercept, 0.035)
     assert np.isclose(slope, 2.2)
 
-    # Inject an outlier for robust linear regression
-    y_Outlier = y.copy()
-    y_Outlier[0] = 150.0
-    r_int, r_slope, wr = rlm_huber(t, y_Outlier)
-    assert np.isclose(r_int, 3.5, atol=0.3)
+    y_outlier = y.copy()
+    y_outlier[0] = 1.5
+    r_int, r_slope, wr = rlm_huber(t, y_outlier)
+    assert np.isclose(r_int, 0.035, atol=0.01)
     assert np.isclose(r_slope, 2.2, atol=0.05)
     assert 0.9 < wr <= 1.0
 
-    assert np.isclose(get_m_diff(t, t + 2.0, use_abs=True), 2.0)
-    assert np.isclose(get_m_diff(t, t + 2.0, use_abs=False), -2.0)
-    assert np.isclose(get_sd_diff(t, t + 2.0), 0.0)
+    assert np.isclose(get_m_diff(t, t + 0.02, use_abs=True), 0.02)
+    assert np.isclose(get_m_diff(t, t + 0.02, use_abs=False), -0.02)
+    assert np.isclose(get_sd_diff(t, t + 0.02), 0.0)
     assert np.isclose(pearson_cor(t, y), 1.0)
 
 
@@ -100,7 +174,7 @@ def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
     pca_res = pca_irlba_torch(raw_x, n_components=n_feat, device=torch.device("cpu"))
 
     x_pc = pca_res.x[:, :n_feat]
-    true_y = 8.0 + 1.5 * x_pc[:, 0] - 0.8 * x_pc[:, 1]
+    true_y = np.clip(0.10 + 0.02 * x_pc[:, 0] - 0.01 * x_pc[:, 1], 0.01, 0.30)
 
     olm_model = train_olm(x_pc, true_y, device=torch.device("cpu"))
     olm_preds = predict_model(olm_model, x_pc, device=torch.device("cpu"))
@@ -112,25 +186,29 @@ def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
     assert pearson_cor(nn_preds, true_y) > 0.95
 
     onnx_path = tmp_path / "model.onnx"
-    feature_names = [f"1:{i * 100 + 1}-{(i + 1) * 100}" for i in range(n_raw_features)]
+    feature_names = [
+        f"1:{i * 5000 + 1}-{(i + 1) * 5000}" for i in range(n_raw_features)
+    ]
     export_pipeline_to_onnx(
         predictor=nn_model,
         mean_features=mean_features,
         pca_center=pca_res.center,
         pca_rotation=pca_res.rotation[:, :n_feat],
-        the_intercept=0.5,
-        the_slope=1.1,
-        the_intercept_x=0.95,
-        the_slope_x=0.005,
+        the_intercept=0.005,
+        the_slope=1.05,
+        the_intercept_x=0.99,
+        the_slope_x=-0.5,
         possible_features=feature_names,
         onnx_path=onnx_path,
+        binsize=5000,
     )
 
     meta = load_onnx_metadata(onnx_path)
     assert meta.possible_features == feature_names
-    assert np.isclose(meta.the_intercept_x, 0.95)
-    assert np.isclose(meta.the_slope_x, 0.005)
+    assert np.isclose(meta.the_intercept_x, 0.99)
+    assert np.isclose(meta.the_slope_x, -0.5)
     assert meta.n_feat == n_feat
+    assert meta.binsize == 5000
     assert not meta.is_olm
 
     sample_with_nan = raw_x[0].copy()
@@ -143,68 +221,276 @@ def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
             0
         ]
     )
-    expected_final = 0.5 + 1.1 * expected_raw
+    expected_final = 0.005 + 1.05 * expected_raw
 
     onnx_pred = run_onnx_inference(onnx_path, sample_with_nan, requested_device="cpu")
     assert np.isclose(onnx_pred, expected_final, atol=1e-4)
 
 
-def _create_synthetic_cohort(base_dir: Path, n_samples: int = 24) -> tuple[Path, Path]:
-    """Create synthetic BED files and config.txt for end-to-end testing."""
-    beds_dir = base_dir / "beds"
-    beds_dir.mkdir(parents=True, exist_ok=True)
+def test_samplesheet_lint_and_validation(tmp_path: Path) -> None:
+    example_sheet = (
+        Path(__file__).resolve().parents[1] / "examples" / "samplesheet.yaml"
+    )
+    entries = load_samplesheet(example_sheet)
+    assert len(entries) == 10
+    assert entries[0].id == "ID_0"
+    assert entries[0].sex == "M"
+    assert entries[0].ff is not None and 0.0 <= entries[0].ff <= 1.0
+
+    res_lint = runner.invoke(app, ["lint", str(example_sheet)])
+    assert res_lint.exit_code == 0
+
+    json_sheet = tmp_path / "samplesheet.json"
+    write_samplesheet(entries, outfile=json_sheet)
+    loaded_json = load_samplesheet(json_sheet)
+    assert loaded_json == entries
+    assert runner.invoke(app, ["lint", str(json_sheet)]).exit_code == 0
+
+    # Test rejection of invalid schema inputs
+    invalid_cases = [
+        ([], "non-empty"),
+        ([{"id": "S1"}], "'filepath' is a required property"),
+        ([{"id": "S1", "filepath": "a.bam", "sex": "X"}], "is not one of"),
+        (
+            [{"id": "S1", "filepath": "a.bam", "ff": 1.5}],
+            "greater than the maximum of 1.0",
+        ),
+        (
+            [{"id": "S1", "filepath": "a.bam", "ff": -0.1}],
+            "less than the minimum of 0.0",
+        ),
+        (
+            [{"id": "S1", "filepath": "a.bam", "extra": 1}],
+            "Additional properties are not allowed",
+        ),
+        (
+            [{"id": "S1", "filepath": "a.bam"}, {"id": "S1", "filepath": "b.bam"}],
+            "duplicate sample id 'S1'",
+        ),
+    ]
+    for payload, expected_err in invalid_cases:
+        with pytest.raises(ValueError, match=expected_err):
+            validate_samplesheet_data(payload)
+
+    bad_yaml = tmp_path / "bad.yaml"
+    bad_yaml.write_text("- id: S1\n  filepath: a.bam\n  ff: 12.5\n", encoding="utf-8")
+    res_bad = runner.invoke(app, ["lint", str(bad_yaml)])
+    assert res_bad.exit_code == 1
+
+    txt_file = tmp_path / "legacy.txt"
+    txt_file.write_text("ID\tfilepath\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported samplesheet format"):
+        load_samplesheet(txt_file)
+
+
+def test_alignment_binning_and_bed_rejection(tmp_path: Path) -> None:
+    bed_file = tmp_path / "legacy.bed"
+    bed_file.write_text("chr1\t0\t5000\t100\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Only aligned read files"):
+        extract_sample_y_profile(bed_file)
+
+    bam_path = tmp_path / "sample.bam"
+    refs = [("chr1", 10000), ("chrY", 10000)]
+    bin_reads = [
+        (0, 100, 30, 0, 200),
+        (0, 5100, 30, 0, 200),
+        (1, 200, 30, 0, 16),
+        (1, 5200, 30, 0, 16),
+        (1, 200, 30, 0x400, 50),  # duplicate flag -> skipped
+        (1, 200, 0, 0, 50),  # mapq 0 -> skipped when mapq=1
+    ]
+    _write_synthetic_bam_from_bin_counts(bam_path, refs, bin_reads)
+
+    # Test native BAM reader directly
+    ref_lengths, bin_counts = _read_bam_native(
+        bam_path, binsize=5000, mapq=1, target_chrs=FFY_TARGET_CHRS
+    )
+    assert ref_lengths == {"1": 10000, "Y": 10000}
+    assert np.array_equal(bin_counts["1"], [200, 200])
+    assert np.array_equal(bin_counts["Y"], [16, 16])
+
+    # Test extract_sample_y_profile & run_ffy_single (0-1 fraction)
+    prof_bam = extract_sample_y_profile(bam_path, binsize=5000, mapq=1)
+    assert np.allclose(prof_bam.y_norm_bins, [0.08, 0.08])
+    bam_sex, bam_ffy = run_ffy_single(bam_path, binsize=5000, mapq=1)
+    assert bam_sex == "M"
+    assert np.isclose(bam_ffy, 0.16)
+
+
+def _create_synthetic_bam_cohort(
+    base_dir: Path, n_samples: int = 24, binsize: int = 5000
+) -> tuple[Path, Path, list[str], list[float]]:
+    """Create synthetic BAM files and a YAML samplesheet for end-to-end FFY + train + predict testing."""
+    bams_dir = base_dir / "bams"
+    bams_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(123)
 
-    chrs = (["1"] * 40) + (["2"] * 40) + (["13"] * 5) + (["X"] * 10) + (["Y"] * 5)
-    starts = [i * 100000 + 1 for i in range(len(chrs))]
-    ends = [(i + 1) * 100000 for i in range(len(chrs))]
+    n_chr1_bins = 20
+    n_chr2_bins = 20
+    n_chr13_bins = 4
+    n_chrx_bins = 8
+    n_chry_bins = 10
+    refs = [
+        ("chr1", n_chr1_bins * binsize),
+        ("chr2", n_chr2_bins * binsize),
+        ("chr13", n_chr13_bins * binsize),
+        ("chrX", n_chrx_bins * binsize),
+        ("chrY", n_chry_bins * binsize),
+    ]
 
-    latent_signal = rng.normal(0.0, 1.0, size=len(chrs))
-    config_rows: list[str] = ["ID\tfilepath\tgender\tFF"]
+    n_auto_feat = n_chr1_bins + n_chr2_bins
+    latent_signal = rng.uniform(-1.2, 1.2, size=n_auto_feat)
+    base_depth = 400.0
+
+    true_sexes: list[str] = []
+    true_ffs: list[float] = []
+    sheet_rows: list[dict[str, str | float]] = []
 
     for i in range(n_samples):
-        gender = "M" if i < 20 else "F"
-        ff = float(rng.uniform(4.0, 18.0)) if gender == "M" else 0.0
-        ratios = (ff / 100.0) * latent_signal + rng.normal(0.0, 0.01, size=len(chrs))
+        sex = "M" if i < 18 else "F"
+        ff = float(rng.uniform(0.04, 0.22)) if sex == "M" else 0.0
+        true_sexes.append(sex)
+        true_ffs.append(ff)
 
-        # Encode X copy number ratio relationship for males
-        for idx, c in enumerate(chrs):
-            if c == "X":
-                ratios[idx] = np.log2(
-                    max(0.5, 1.0 - 0.004 * ff + rng.normal(0.0, 0.001))
-                )
+        bin_reads: list[tuple[int, int, int, int, int]] = []
+        # chr1 & chr2 (autosomal features encoding latent fetal signal)
+        for b in range(n_chr1_bins):
+            ratio_log2 = ff * latent_signal[b] + float(rng.normal(0.0, 0.005))
+            cnt = max(1, round(base_depth * (2.0**ratio_log2)))
+            bin_reads.append((0, b * binsize + 100, 30, 0, cnt))
+        for b in range(n_chr2_bins):
+            if b == 0:
+                # Always 0 reads in chr2 bin 0 -> tests NaN filtering/handling
+                continue
+            ratio_log2 = ff * latent_signal[n_chr1_bins + b] + float(
+                rng.normal(0.0, 0.005)
+            )
+            cnt = max(1, round(base_depth * (2.0**ratio_log2)))
+            bin_reads.append((1, b * binsize + 100, 30, 0, cnt))
+        # chr13 (excluded autosome)
+        for b in range(n_chr13_bins):
+            bin_reads.append((2, b * binsize + 100, 30, 0, int(base_depth)))
+        # chrX (copy-number ratio decreases linearly with male FF)
+        x_scale = (1.0 - 0.5 * ff) if sex == "M" else 1.0
+        for b in range(n_chrx_bins):
+            cnt = max(
+                1,
+                round(base_depth * (x_scale + float(rng.normal(0.0, 0.002)))),
+            )
+            bin_reads.append((3, b * binsize + 100, 30, 0, cnt))
+        # chrY (bins 2..7 informative for male FF, bins 0..1 baseline noise)
+        for b in range(n_chry_bins):
+            if 2 <= b < 8:
+                y_frac = (0.002 + 0.5 * ff) if sex == "M" else 0.002
+            else:
+                y_frac = 0.001
+            cnt = max(0, round(base_depth * y_frac))
+            bin_reads.append((4, b * binsize + 100, 30, 0, cnt))
 
-        # Always NaN on locus 0 (simulating centromere/telomere)
-        ratios[0] = np.nan
-
-        bed_path = beds_dir / f"sample_{i}.bed"
-        df = pl.DataFrame(
+        bam_path = bams_dir / f"sample_{i}.bam"
+        _write_synthetic_bam_from_bin_counts(bam_path, refs, bin_reads)
+        sheet_rows.append(
             {
-                "chr": chrs,
-                "start": starts,
-                "end": ends,
-                "ratio": ["NaN" if np.isnan(val) else f"{val:.8f}" for val in ratios],
+                "id": f"ID_{i}",
+                "filepath": bam_path.as_posix(),
+                "sex": sex,
+                "ff": round(ff, 6),
             }
         )
-        df.write_csv(bed_path, separator="\t")
-        config_rows.append(f"ID_{i}\t{bed_path.as_posix()}\t{gender}\t{ff}")
 
-    config_path = base_dir / "config.txt"
-    config_path.write_text("\n".join(config_rows) + "\n", encoding="utf-8")
-    return config_path, beds_dir / "sample_0.bed"
+    samplesheet_path = base_dir / "samplesheet.yaml"
+    samplesheet_path.write_text(
+        yaml.safe_dump(sheet_rows, sort_keys=False), encoding="utf-8"
+    )
+    return samplesheet_path, bams_dir / "sample_0.bam", true_sexes, true_ffs
+
+
+def test_ffy_cohort_lasso_onnx_and_cli(tmp_path: Path) -> None:
+    samplesheet_path, sample0_bam, true_sexes, true_ffs = _create_synthetic_bam_cohort(
+        tmp_path, n_samples=24, binsize=5000
+    )
+    entries = load_samplesheet(samplesheet_path)
+    unlabeled_sheet = tmp_path / "unlabeled.yaml"
+    write_samplesheet(
+        [type(e)(id=e.id, filepath=e.filepath, sex=None, ff=None) for e in entries],
+        outfile=unlabeled_sheet,
+    )
+
+    out_sheet = tmp_path / "samplesheet_out.json"
+    ffy_onnx = tmp_path / "ffy_model.onnx"
+
+    res_cli = runner.invoke(
+        app,
+        [
+            "ffy",
+            "-s",
+            str(unlabeled_sheet),
+            "--outfile",
+            str(out_sheet),
+            "--save-model",
+            str(ffy_onnx),
+            "--binsize",
+            "5000",
+            "--cpus",
+            "2",
+            "--seed",
+            "1",
+        ],
+    )
+    assert res_cli.exit_code == 0, res_cli.stdout
+    assert out_sheet.is_file()
+    assert ffy_onnx.is_file()
+
+    out_entries = load_samplesheet(out_sheet)
+    assert [e.sex for e in out_entries] == true_sexes
+    est_ffs = np.array([float(e.ff or 0.0) for e in out_entries])
+    assert np.all((est_ffs >= 0.0) & (est_ffs <= 1.0))
+    assert np.allclose(est_ffs[18:], 0.0)
+    assert pearson_cor(est_ffs[:18], np.array(true_ffs[:18])) > 0.98
+
+    meta = load_ffy_onnx_metadata(ffy_onnx)
+    assert len(meta.bin_loci) == 10
+    assert meta.binsize == 5000
+
+    norm_args = _normalize_argv(
+        [
+            "ffy",
+            "--infile",
+            str(sample0_bam),
+            "--model",
+            str(ffy_onnx),
+            "--device",
+            "cpu",
+            "--json",
+        ]
+    )
+    res_single = runner.invoke(app, norm_args)
+    assert res_single.exit_code == 0
+    payload = json.loads(res_single.stdout.strip())
+    assert payload["sex"] == "M"
+    assert 0.0 < payload["FFY"] <= 1.0
+    assert np.isclose(payload["FFY"], true_ffs[0], atol=0.02)
+
+    fem_bam = entries[20].filepath
+    fem_sex, fem_ffy = run_ffy_single(fem_bam, model_path=ffy_onnx, device_name="cpu")
+    assert fem_sex == "F"
+    assert fem_ffy == 0.0
 
 
 def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
-    config_path, sample_bed = _create_synthetic_cohort(tmp_path, n_samples=24)
+    samplesheet_path, sample_bam, _, _ = _create_synthetic_bam_cohort(
+        tmp_path, n_samples=24, binsize=5000
+    )
     outdir_nn = tmp_path / "out_nn"
 
     onnx_path = run_train(
-        config_path=config_path,
+        samplesheet_path=samplesheet_path,
         outdir=outdir_nn,
         n_feat=3,
         hidden=2,
         cpus=2,
         olm=False,
+        binsize=5000,
         device_name="cpu",
         seed=1,
     )
@@ -218,6 +504,7 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
     stats_text = (outdir_nn / "training_statistics.txt").read_text(encoding="utf-8")
     assert "PREFACE - PREdict FetAl ComponEnt" in stats_text
     assert "Overall correlation (r):" in stats_text
+    assert "FF < 0.1 mean absolute error (MAE):" in stats_text
 
     # Test CLI predict in default, bare --json, and --json <file> modes
     res_std = runner.invoke(
@@ -225,7 +512,7 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
         [
             "predict",
             "--infile",
-            str(sample_bed),
+            str(sample_bam),
             "--model",
             str(onnx_path),
             "--device",
@@ -235,14 +522,16 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
     assert res_std.exit_code == 0
     assert "FFX =" in res_std.stdout
     assert "PREFACE =" in res_std.stdout
+    assert "%" not in res_std.stdout
 
     norm_args = _normalize_argv(
-        ["predict", "--infile", str(sample_bed), "--model", str(onnx_path), "--json"]
+        ["predict", "--infile", str(sample_bam), "--model", str(onnx_path), "--json"]
     )
     res_json_stdout = runner.invoke(app, norm_args)
     assert res_json_stdout.exit_code == 0
     parsed = json.loads(res_json_stdout.stdout.strip())
     assert "FFX" in parsed and "PREFACE" in parsed
+    assert 0.0 < parsed["PREFACE"] < 1.0
 
     json_file = tmp_path / "pred.json"
     res_json_file = runner.invoke(
@@ -250,7 +539,7 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
         [
             "predict",
             "--infile",
-            str(sample_bed),
+            str(sample_bam),
             "--model",
             str(onnx_path),
             "--json",
@@ -261,304 +550,42 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
     assert json_file.is_file()
     assert json.loads(json_file.read_text(encoding="utf-8")) == parsed
 
-    # Test CLI train with --olm
+    # Test CLI train with --olm and auto-FFY estimation on unlabeled samplesheet
+    entries = load_samplesheet(samplesheet_path)
+    unlabeled_sheet = tmp_path / "unlabeled_train.yaml"
+    write_samplesheet(
+        [type(e)(id=e.id, filepath=e.filepath, sex=None, ff=None) for e in entries],
+        outfile=unlabeled_sheet,
+    )
     outdir_olm = tmp_path / "out_olm"
     res_train_olm = runner.invoke(
         app,
         [
             "train",
-            "--config",
-            str(config_path),
+            "-s",
+            str(unlabeled_sheet),
             "--outdir",
             str(outdir_olm),
             "--nfeat",
             "3",
             "--olm",
+            "--binsize",
+            "5000",
+            "--ffy-binsize",
+            "5000",
             "--cpus",
             "2",
             "--device",
             "cpu",
         ],
     )
-    assert res_train_olm.exit_code == 0
+    assert res_train_olm.exit_code == 0, res_train_olm.stdout
     assert (outdir_olm / "model.onnx").is_file()
     ffx_val, pref_val = run_predict(
-        sample_bed, outdir_olm / "model.onnx", device_name="cpu"
+        sample_bam, outdir_olm / "model.onnx", device_name="cpu"
     )
     assert np.isfinite(ffx_val)
     assert np.isfinite(pref_val)
-
-
-def _make_bgzf_block(payload: bytes) -> bytes:
-    """Wrap uncompressed bytes into a valid BGZF block."""
-    import struct
-    import zlib
-
-    comp_obj = zlib.compressobj(level=6, method=zlib.DEFLATED, wbits=-zlib.MAX_WBITS)
-    cdata = comp_obj.compress(payload) + comp_obj.flush()
-    bsize = 12 + 6 + len(cdata) + 8 - 1
-    header = struct.pack(
-        "<BBBBIBBHBBHH",
-        0x1F,
-        0x8B,
-        8,
-        0x04,
-        0,
-        0,
-        0xFF,
-        6,
-        66,
-        67,
-        2,
-        bsize,
-    )
-    crc = zlib.crc32(payload) & 0xFFFFFFFF
-    trailer = struct.pack("<II", crc, len(payload))
-    return header + cdata + trailer
-
-
-def _write_synthetic_bam(
-    bam_path: Path,
-    refs: list[tuple[str, int]],
-    reads: list[tuple[int, int, int, int]],
-) -> None:
-    """Write a minimal valid BGZF-compressed BAM file from (ref_id, pos0, mapq, flag) tuples."""
-    import struct
-
-    parts: list[bytes] = [b"BAM\x01", struct.pack("<i", 0)]
-    parts.append(struct.pack("<i", len(refs)))
-    for name, length in refs:
-        name_b = name.encode("ascii") + b"\x00"
-        parts.append(
-            struct.pack("<i", len(name_b)) + name_b + struct.pack("<i", length)
-        )
-
-    for ref_id, pos0, mapq, flag in reads:
-        qname = b"r\x00"
-        rec_body = (
-            struct.pack(
-                "<iiBBHHHiiii",
-                ref_id,
-                pos0,
-                len(qname),
-                mapq,
-                4680,
-                0,
-                flag,
-                0,
-                -1,
-                -1,
-                0,
-            )
-            + qname
-        )
-        parts.append(struct.pack("<i", len(rec_body)) + rec_body)
-
-    uncompressed = b"".join(parts)
-    bam_bytes = _make_bgzf_block(uncompressed) + _make_bgzf_block(b"")
-    bam_path.write_bytes(bam_bytes)
-
-
-def test_ffy_binned_bed_and_bam_extraction(tmp_path: Path) -> None:
-    example_counts = Path(__file__).resolve().parents[1] / "examples" / "counts.bed"
-    ex_gender, ex_ffy = run_ffy_single(example_counts)
-    assert ex_gender == "M"
-    assert np.isclose(ex_ffy, 10.46, atol=0.05)
-
-    bed_headerless = tmp_path / "counts_nohdr.bed"
-    bed_headerless.write_text(
-        "chr1\t0\t5000\t1000\n"
-        "chr2\t0\t5000\t1000\n"
-        "chrY\t3000000\t3005000\t50\n"
-        "chrY\t3005000\t3010000\t50\n",
-        encoding="utf-8",
-    )
-    prof_bed = extract_sample_y_profile(bed_headerless)
-    assert prof_bed.bin_loci == ["Y:3000000-3005000", "Y:3005000-3010000"]
-    assert np.allclose(prof_bed.y_norm_bins, [0.05, 0.05])
-
-    gender, ffy_pct = run_ffy_single(bed_headerless)
-    assert gender == "M"
-    assert np.isclose(ffy_pct, 10.0)
-
-    bad_bed = tmp_path / "bad_ratios.bed"
-    bad_bed.write_text(
-        "chr\tstart\tend\tratio\n1\t0\t5000\t-0.12\nY\t0\t5000\t0.05\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="negative"):
-        extract_sample_y_profile(bad_bed)
-
-    bam_path = tmp_path / "sample.bam"
-    refs = [("chr1", 10000), ("chrY", 10000)]
-    reads: list[tuple[int, int, int, int]] = []
-    for _ in range(200):
-        reads.append((0, 100, 30, 0))
-        reads.append((0, 5100, 30, 0))
-    for _ in range(16):
-        reads.append((1, 200, 30, 0))
-        reads.append((1, 5200, 30, 0))
-    for _ in range(50):
-        reads.append((1, 200, 30, 0x400))
-        reads.append((1, 200, 0, 0))
-
-    _write_synthetic_bam(bam_path, refs, reads)
-    prof_bam = extract_sample_y_profile(bam_path, binsize=5000, mapq=1)
-    assert np.allclose(prof_bam.y_norm_bins, [0.08, 0.08])
-    bam_gender, bam_ffy = run_ffy_single(bam_path, binsize=5000, mapq=1)
-    assert bam_gender == "M"
-    assert np.isclose(bam_ffy, 16.0)
-
-
-def test_ffy_cohort_lasso_onnx_and_cli(tmp_path: Path) -> None:
-    rng = np.random.default_rng(42)
-    counts_dir = tmp_path / "counts"
-    counts_dir.mkdir(parents=True, exist_ok=True)
-
-    n_samples = 24
-    true_genders = (["M"] * 14) + (["F"] * 10)
-    true_ffs = [
-        float(rng.uniform(4.5, 22.0)) if g == "M" else 0.0 for g in true_genders
-    ]
-
-    chrs = (["1"] * 5) + (["Y"] * 10)
-    starts = [i * 5000 + 1 for i in range(5)] + [
-        3_000_000 + i * 5000 + 1 for i in range(10)
-    ]
-    ends = [(i + 1) * 5000 for i in range(5)] + [
-        3_000_000 + (i + 1) * 5000 for i in range(10)
-    ]
-    starts[5], ends[5] = 10001, 15000
-    starts[6], ends[6] = 15001, 20000
-    starts[13], ends[13] = 30_000_001, 30_005_000
-    starts[14], ends[14] = 30_005_001, 30_010_000
-
-    manifest_rows = ["ID\tfilepath"]
-    for i in range(n_samples):
-        ff_frac = true_ffs[i] / 100.0
-        auto_c = [10000.0 + float(rng.normal(0.0, 20.0)) for _ in range(5)]
-        par_c = [5000.0 + float(rng.normal(0.0, 30.0)) for _ in range(2)]
-        euch_c = [
-            10000.0 * (0.002 + 0.5 * ff_frac + max(0.0, float(rng.normal(0.0, 0.0005))))
-            for _ in range(6)
-        ]
-        het_c = [0.0, 0.0]
-        all_counts = auto_c + par_c + euch_c + het_c
-
-        bed_file = counts_dir / f"sample_{i}.bed"
-        pl.DataFrame(
-            {
-                "chr": chrs,
-                "start": starts,
-                "end": ends,
-                "count": all_counts,
-            }
-        ).write_csv(bed_file, separator="\t")
-        manifest_rows.append(f"ID_{i}\t{bed_file.as_posix()}")
-
-    lb_bed = counts_dir / "male_lb.bed"
-    pl.DataFrame(
-        {
-            "chr": chrs,
-            "start": starts,
-            "end": ends,
-            "count": ([10000.0] * 5)
-            + ([5000.0] * 2)
-            + ([10000.0 * 0.502] * 6)
-            + ([0.0] * 2),
-        }
-    ).write_csv(lb_bed, separator="\t")
-
-    manifest_path = tmp_path / "manifest.txt"
-    manifest_path.write_text("\n".join(manifest_rows) + "\n", encoding="utf-8")
-    out_config = tmp_path / "config_out.txt"
-    ffy_onnx = tmp_path / "ffy_model.onnx"
-
-    res_cli = runner.invoke(
-        app,
-        [
-            "ffy",
-            "--config",
-            str(manifest_path),
-            "--outfile",
-            str(out_config),
-            "--save-model",
-            str(ffy_onnx),
-            "--male-ref",
-            str(lb_bed),
-            "--cpus",
-            "2",
-            "--seed",
-            "1",
-        ],
-    )
-    assert res_cli.exit_code == 0, res_cli.stdout
-    assert out_config.is_file()
-    assert ffy_onnx.is_file()
-
-    out_df = pl.read_csv(out_config, separator="\t")
-    assert out_df.columns == ["ID", "filepath", "gender", "FF"]
-    assert out_df["gender"].to_list() == true_genders
-
-    est_ffs = out_df["FF"].to_numpy()
-    assert np.allclose(est_ffs[14:], 0.0)
-    assert pearson_cor(est_ffs[:14], np.array(true_ffs[:14])) > 0.99
-    assert get_m_diff(est_ffs[:14], np.array(true_ffs[:14]), use_abs=True) < 0.8
-
-    meta = load_ffy_onnx_metadata(ffy_onnx)
-    assert len(meta.bin_loci) == 10
-    assert len(meta.informative_indices) == 6
-
-    sample0_bed = counts_dir / "sample_0.bed"
-    norm_args = _normalize_argv(
-        [
-            "ffy",
-            "--infile",
-            str(sample0_bed),
-            "--model",
-            str(ffy_onnx),
-            "--device",
-            "cpu",
-            "--json",
-        ]
-    )
-    res_single = runner.invoke(app, norm_args)
-    assert res_single.exit_code == 0
-    payload = json.loads(res_single.stdout.strip())
-    assert payload["gender"] == "M"
-    assert np.isclose(payload["FFY"] * 100.0, true_ffs[0], atol=1.0)
-
-    sample_fem = counts_dir / "sample_15.bed"
-    fem_gender, fem_ffy = run_ffy_single(
-        sample_fem, model_path=ffy_onnx, device_name="cpu"
-    )
-    assert fem_gender == "F"
-    assert fem_ffy == 0.0
-
-    df_theoretical = run_ffy_cohort(config_path=manifest_path, cpus=2, seed=1)
-    assert df_theoretical["gender"].to_list() == true_genders
-    assert (
-        pearson_cor(df_theoretical["FF"].to_numpy()[:14], np.array(true_ffs[:14]))
-        > 0.99
-    )
-
-    reads_only_manifest = tmp_path / "manifest_reads_only.txt"
-    reads_only_rows = ["ID\treads_filepath\tgender"] + [
-        f"ID_{i}\t{(counts_dir / f'sample_{i}.bed').as_posix()}\t{true_genders[i]}"
-        for i in range(n_samples)
-    ]
-    reads_only_manifest.write_text("\n".join(reads_only_rows) + "\n", encoding="utf-8")
-    df_reads_only = run_ffy_cohort(config_path=reads_only_manifest, cpus=1, seed=1)
-    assert df_reads_only.columns == ["ID", "filepath", "gender", "FF"]
-    assert df_reads_only["filepath"].to_list() == [
-        (counts_dir / f"sample_{i}.bed").as_posix() for i in range(n_samples)
-    ]
-    assert np.allclose(df_reads_only["FF"].to_numpy(), df_theoretical["FF"].to_numpy())
-
-    bad_manifest = tmp_path / "bad_manifest.txt"
-    bad_manifest.write_text("ID\tgender\nID_0\tM\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="missing required column"):
-        run_ffy_cohort(config_path=bad_manifest, cpus=1, seed=1)
 
 
 def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
@@ -569,19 +596,28 @@ def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Unsupported log level"):
         configure_logging("TRACE")
 
-    example_counts = Path(__file__).resolve().parents[1] / "examples" / "counts.bed"
+    bam_path = tmp_path / "log_sample.bam"
+    refs = [("chr1", 10000), ("chrY", 10000)]
+    bin_reads = [
+        (0, 100, 30, 0, 200),
+        (0, 5100, 30, 0, 200),
+        (1, 200, 30, 0, 16),
+        (1, 5200, 30, 0, 16),
+    ]
+    _write_synthetic_bam_from_bin_counts(bam_path, refs, bin_reads)
+
     res_debug = runner.invoke(
         app,
         [
             "ffy",
             "--infile",
-            str(example_counts),
+            str(bam_path),
             "--loglevel",
             "DEBUG",
         ],
     )
     assert res_debug.exit_code == 0
-    assert "gender = M" in res_debug.stdout
+    assert "sex = M" in res_debug.stdout
     assert "Single-sample FFY" in res_debug.output
 
     res_root_err = runner.invoke(
@@ -591,11 +627,11 @@ def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
             "ERROR",
             "ffy",
             "--infile",
-            str(example_counts),
+            str(bam_path),
         ],
     )
     assert res_root_err.exit_code == 0
-    assert "gender = M" in res_root_err.stdout
+    assert "sex = M" in res_root_err.stdout
     assert "Single-sample FFY" not in res_root_err.output
 
     res_invalid = runner.invoke(
@@ -603,7 +639,7 @@ def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
         [
             "ffy",
             "--infile",
-            str(example_counts),
+            str(bam_path),
             "--loglevel",
             "INVALID",
         ],
@@ -630,61 +666,12 @@ def test_parallel_load_samples(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="Missing sample -1"):
         parallel_load_samples(bad_items, _square_or_fail_worker, cpus=2)
 
-    config_path, _ = _create_synthetic_cohort(tmp_path, n_samples=8)
-    cfg_df = load_config(config_path, rng=np.random.default_rng(1))
-    ds_1 = load_training_dataset(cfg_df, cpus=1)
-    ds_2 = load_training_dataset(cfg_df, cpus=2)
+    samplesheet_path, _, _, _ = _create_synthetic_bam_cohort(
+        tmp_path, n_samples=8, binsize=5000
+    )
+    entries = load_samplesheet(samplesheet_path, rng=np.random.default_rng(1))
+    ds_1 = load_training_dataset(entries, binsize=5000, cpus=1)
+    ds_2 = load_training_dataset(entries, binsize=5000, cpus=2)
     assert ds_1.possible_features == ds_2.possible_features
     assert np.allclose(ds_1.training_frame, ds_2.training_frame)
     assert np.allclose(ds_1.x_ratios, ds_2.x_ratios)
-
-
-def test_read_bed_table_commented_headers(tmp_path: Path) -> None:
-    cases = {
-        "standard": "chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
-        "commented": "#chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
-        "commented_spaced": "# chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
-        "metadata_preceding": "##track name=sample\n# date=2026-10-26\n#chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n",
-        "aliases_extra_cols": "##track\n#chrom\tchromStart\tchromEnd\tratio\textra\n1\t100\t200\t0.5\tfoo\nX\t200\t300\t1.1\tbar\n",
-    }
-    for name, content in cases.items():
-        bed_file = tmp_path / f"{name}.bed"
-        bed_file.write_text(content)
-        df = _read_bed_table(bed_file)
-        assert df.columns == ["chr", "start", "end", "ratio"]
-        assert df.height == 2
-        assert df["chr"].to_list() == ["1", "X"]
-        assert df["start"].to_list() == [100, 200]
-        assert df["end"].to_list() == [200, 300]
-        assert df["ratio"].to_list() == [0.5, 1.1]
-
-    # Test FFY reader with metadata comments and commented header
-    ffy_bed = tmp_path / "ffy_commented.bed"
-    ffy_bed.write_text(
-        "##fileformat=bed\n# date=2026\n#chr\tstart\tend\tcount\n1\t1000001\t1005000\t500\nY\t3000001\t3005000\t100\n"
-    )
-    prof = extract_sample_y_profile(ffy_bed)
-    assert prof.bin_loci == ["Y:3000001-3005000"]
-    assert len(prof.y_norm_bins) == 1
-
-    # Test gzip compressed bed file with commented header and metadata
-    gz_bed = tmp_path / "sample_commented.bed.gz"
-    gz_content = gzip.compress(
-        b"##track name=sample\n# date=2026-10-26\n#chr\tstart\tend\tratio\n1\t100\t200\t0.5\nX\t200\t300\t1.1\n"
-    )
-    gz_bed.write_bytes(gz_content)
-    df_gz = _read_bed_table(gz_bed)
-    assert df_gz.columns == ["chr", "start", "end", "ratio"]
-    assert df_gz.height == 2
-    assert df_gz["chr"].to_list() == ["1", "X"]
-
-    # Test gzip compressed FFY bed file
-    gz_ffy = tmp_path / "ffy_commented.bed.gz"
-    gz_ffy.write_bytes(
-        gzip.compress(
-            b"##fileformat=bed\n# date=2026\n#chr\tstart\tend\tcount\n1\t1000001\t1005000\t500\nY\t3000001\t3005000\t100\n"
-        )
-    )
-    prof_gz = extract_sample_y_profile(gz_ffy)
-    assert prof_gz.bin_loci == ["Y:3000001-3005000"]
-    assert len(prof_gz.y_norm_bins) == 1

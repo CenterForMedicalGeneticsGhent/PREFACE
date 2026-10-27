@@ -95,6 +95,7 @@ class ONNXModelMetadata:
     the_slope_x: float
     n_feat: int
     is_olm: bool
+    binsize: int
     version: str
 
 
@@ -136,7 +137,7 @@ def train_neural_net(
     hidden: int,
     device: torch.device,
     stepmax: int = 100_000,
-    threshold: float = 0.01,
+    threshold: float = 1e-4,
 ) -> PrefacePredictor:
     """Train single-hidden-layer Sigmoid neural network using full-batch Rprop matching R's neuralnet."""
     n_samples, n_feat = x_train.shape
@@ -273,6 +274,7 @@ def export_pipeline_to_onnx(
     the_slope_x: float,
     possible_features: list[str],
     onnx_path: Path,
+    binsize: int = 100_000,
 ) -> None:
     """Export the full PREFACE preprocessing + model + skew-correction pipeline to a single ONNX file."""
     cpu_predictor = predictor.cpu().eval()
@@ -308,6 +310,7 @@ def export_pipeline_to_onnx(
             "the_slope_X": repr(float(the_slope_x)),
             "n_feat": str(cpu_predictor.n_feat),
             "is_olm": "1" if cpu_predictor.is_olm else "0",
+            "binsize": str(binsize),
             "version": __version__,
         },
         onnx_path,
@@ -326,6 +329,7 @@ def load_onnx_metadata(onnx_path: Path) -> ONNXModelMetadata:
         the_slope_x=float(props["the_slope_X"]),
         n_feat=int(props["n_feat"]),
         is_olm=props["is_olm"] == "1",
+        binsize=int(props.get("binsize", "100000")),
         version=props.get("version", __version__),
     )
 
@@ -387,7 +391,7 @@ def export_ffy_model_to_onnx(
                 "lasso_intercept", TensorProto.FLOAT, [1], [float(intercept)]
             ),
             helper.make_tensor("clip_min", TensorProto.FLOAT, [], [0.0]),
-            helper.make_tensor("clip_max", TensorProto.FLOAT, [], [100.0]),
+            helper.make_tensor("clip_max", TensorProto.FLOAT, [], [1.0]),
             helper.make_tensor("squeeze_axes", TensorProto.INT64, [1], [1]),
         ],
     )
@@ -445,4 +449,4 @@ def run_ffy_onnx_inference(
     pred = _run_single_onnx_tensor(
         onnx_path, "y_norm", "ffy_prediction", aligned_y, requested_device
     )
-    return float(np.clip(pred, 0.0, 100.0))
+    return float(np.clip(pred, 0.0, 1.0))

@@ -176,13 +176,14 @@ def infer_sex_gmm_1d(
             "M" if float(s) >= fallback_threshold else "F" for s in scores
         ], fallback_threshold
 
-    mu0 = float(np.percentile(scores, 20))
-    mu1 = float(np.percentile(scores, 80))
-    if mu1 - mu0 < 1e-4:
-        mu0, mu1 = float(np.min(scores)), float(np.max(scores))
-
-    var0 = max(float(np.var(scores)) * 0.25, 1e-6)
-    var1 = max(float(np.var(scores)) * 0.50, 1e-6)
+    mu0 = float(np.min(scores))
+    above = scores[scores > mu0 + 0.005]
+    mu1 = float(np.mean(above)) if above.size > 0 else float(np.max(scores))
+    var0 = 1e-6
+    var1 = max(
+        float(np.var(above)) if above.size > 1 else float(np.var(scores)) * 0.50,
+        1e-5,
+    )
     pi0 = 0.5
 
     for _ in range(100):
@@ -226,14 +227,14 @@ def infer_sex_gmm_1d(
 
 def fit_lasso_fista(
     x_mat: np.ndarray,
-    y_prior_pct: np.ndarray,
+    y_prior: np.ndarray,
     lam: float = 1e-4,
     max_iter: int = 500,
     tol: float = 1e-6,
 ) -> tuple[float, np.ndarray]:
     """Fit non-negative Lasso regression on standardized chrY bins matching PMC6771918 Eq. 3."""
     n_samples, n_bins = x_mat.shape
-    y_frac = np.asarray(y_prior_pct, dtype=np.float64).ravel() / 100.0
+    y_frac = np.asarray(y_prior, dtype=np.float64).ravel()
     y_mean = float(np.mean(y_frac))
     y_centered = y_frac - y_mean
 
@@ -243,7 +244,7 @@ def fit_lasso_fista(
     active = x_std_dev > 1e-8
 
     if not np.any(active) or float(np.std(y_frac)) < 1e-8:
-        return y_mean * 100.0, np.zeros(n_bins, dtype=np.float64)
+        return y_mean, np.zeros(n_bins, dtype=np.float64)
 
     x_act = (x_clean[:, active] - x_mean[active]) / x_std_dev[active]
     m_active = int(np.sum(active))
@@ -275,7 +276,7 @@ def fit_lasso_fista(
             break
 
     scaled_beta = beta / x_std_dev[active]
-    intercept_pct = (y_mean - float(np.dot(x_mean[active], scaled_beta))) * 100.0
+    intercept = y_mean - float(np.dot(x_mean[active], scaled_beta))
     full_weights = np.zeros(n_bins, dtype=np.float64)
-    full_weights[active] = scaled_beta * 100.0
-    return intercept_pct, full_weights
+    full_weights[active] = scaled_beta
+    return intercept, full_weights
