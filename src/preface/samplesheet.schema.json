@@ -16,6 +16,11 @@
         "type": "string",
         "minLength": 1
       },
+      "index": {
+        "type": ["string", "null"],
+        "minLength": 1,
+        "pattern": "\\.(gzi|bai|csi|crai)$"
+      },
       "sex": {
         "type": ["string", "null"],
         "enum": ["M", "F", null]

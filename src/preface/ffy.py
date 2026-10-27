@@ -52,6 +52,7 @@ def extract_sample_y_profile(
     binsize: int = 5000,
     mapq: int = 1,
     reference: Path | None = None,
+    index: Path | None = None,
 ) -> SampleYProfile:
     """Extract diploid-normalized chromosome Y bin profile from an alignment file."""
     ref_lengths, bin_counts = read_alignment_bins(
@@ -60,6 +61,7 @@ def extract_sample_y_profile(
         mapq=mapq,
         reference=reference,
         target_chrs=FFY_TARGET_CHRS,
+        index=index,
     )
     if "Y" not in ref_lengths or "Y" not in bin_counts:
         raise ValueError(
@@ -106,11 +108,11 @@ def _align_profile_to_loci(
 
 
 def _extract_profile_worker(
-    args: tuple[Path, int, int, Path | None],
+    args: tuple[Path, int, int, Path | None, Path | None],
 ) -> SampleYProfile:
-    path, binsize, mapq, reference = args
+    path, binsize, mapq, reference, index = args
     return extract_sample_y_profile(
-        path, binsize=binsize, mapq=mapq, reference=reference
+        path, binsize=binsize, mapq=mapq, reference=reference, index=index
     )
 
 
@@ -194,12 +196,15 @@ def estimate_cohort_ffy(
 
     rng = np.random.default_rng(seed)
 
-    combined_items: list[tuple[str, tuple[Path, int, int, Path | None]]] = [
-        (entry.id, (entry.filepath, binsize, mapq, reference)) for entry in entry_list
+    combined_items: list[
+        tuple[str, tuple[Path, int, int, Path | None, Path | None]]
+    ] = [
+        (entry.id, (entry.filepath, binsize, mapq, reference, entry.index))
+        for entry in entry_list
     ]
     if male_ref_paths:
         combined_items.extend(
-            (f"male_ref:{p.name}", (p, binsize, mapq, reference))
+            (f"male_ref:{p.name}", (p, binsize, mapq, reference, None))
             for p in male_ref_paths
         )
 
@@ -343,6 +348,7 @@ def estimate_cohort_ffy(
         SampleEntry(
             id=entry.id,
             filepath=entry.filepath,
+            index=entry.index,
             sex=sex,
             ff=float(entry.ff) if entry.ff is not None else float(ffy_val),
         )

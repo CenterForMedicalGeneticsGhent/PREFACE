@@ -36,7 +36,8 @@ Cohort commands (`preface ffy` and `preface train`) consume a unified YAML or JS
 - Every samplesheet is automatically validated against the bundled JSON Schema (`src/preface/samplesheet.schema.json`).
 - Each sample object supports the following properties (`additionalProperties: false`):
     - `id` (required `string`): Unique identifier for the sample.
-    - `filepath` (required `string`): Path to the sample's aligned read file (`.bam`, `.cram`, or `.sam`).
+    - `filepath` (required `string`): Path to the sample's aligned read file (`.bam`, `.cram`, or `.sam`). Must exist on disk and be readable.
+    - `index` (optional `string` or `null`): Path to the alignment index file (`.gzi`, `.bai`, `.csi`, or `.crai`). Must exist on disk and be readable when provided.
     - `sex` (optional `"M"`, `"F"`, or `null`): Fetal sex (`M` for male, `F` for female). Automatically inferred by `preface ffy` (or `preface train`) when omitted or `null`.
     - `ff` (optional `number` in `[0.0, 1.0]` or `null`): Fetal fraction expressed as a proportion between `0.0` and `1.0`. Automatically estimated by `preface ffy` (or `preface train`) when omitted or `null`.
 
@@ -45,6 +46,7 @@ Example YAML samplesheet:
 ```yaml
 - id: ID_0
   filepath: /path/to/ID_0.bam
+  index: /path/to/ID_0.bam.bai
   sex: M
   ff: 0.10470662
 - id: ID_1

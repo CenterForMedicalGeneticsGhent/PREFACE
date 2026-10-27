@@ -27,6 +27,7 @@ logger = get_logger(__name__)
 SAMPLESHEET_SCHEMA_PATH: Path = Path(__file__).with_name("samplesheet.schema.json")
 SAMPLESHEET_SUFFIXES: frozenset[str] = frozenset({".yaml", ".yml", ".json"})
 ALIGNMENT_SUFFIXES: frozenset[str] = frozenset({".bam", ".cram", ".sam"})
+INDEX_SUFFIXES: frozenset[str] = frozenset({".gzi", ".bai", ".csi", ".crai"})
 SKIP_BAM_FLAGS: int = 0x4 | 0x100 | 0x200 | 0x400 | 0x800
 
 ALL_AUTOSOME_CHRS: frozenset[str] = frozenset(str(i) for i in range(1, 23))
@@ -44,16 +45,20 @@ class SampleEntry:
 
     id: str
     filepath: Path
+    index: Path | None = None
     sex: str | None = None
     ff: float | None = None
 
     def to_dict(self) -> dict[str, str | float | None]:
-        return {
+        data: dict[str, str | float | None] = {
             "id": self.id,
             "filepath": self.filepath.as_posix(),
-            "sex": self.sex,
-            "ff": self.ff,
         }
+        if self.index is not None:
+            data["index"] = self.index.as_posix()
+        data["sex"] = self.sex
+        data["ff"] = self.ff
+        return data
 
 
 @dataclass(frozen=True)
@@ -80,8 +85,33 @@ def load_samplesheet_schema() -> dict[str, Any]:
     return json.loads(SAMPLESHEET_SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
+def _resolve_and_check_readable_file(
+    raw_path: str,
+    field_name: str,
+    sample_id: str,
+    source: Path | str,
+    base_dir: Path | None = None,
+) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute() and not path.exists() and base_dir is not None:
+        candidate = base_dir / path
+        if candidate.exists():
+            path = candidate
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Samplesheet '{source}' sample '{sample_id}' {field_name} '{raw_path}' does not exist."
+        )
+    if not os.access(path, os.R_OK):
+        raise PermissionError(
+            f"Samplesheet '{source}' sample '{sample_id}' {field_name} '{raw_path}' is not readable."
+        )
+    return path
+
+
 def validate_samplesheet_data(
-    data: object, source: Path | str = "<samplesheet>"
+    data: object,
+    source: Path | str = "<samplesheet>",
+    base_dir: Path | None = None,
 ) -> list[SampleEntry]:
     """Validate parsed samplesheet data against the JSON Schema and return SampleEntry objects."""
     schema = load_samplesheet_schema()
@@ -109,12 +139,30 @@ def validate_samplesheet_data(
                 f"Samplesheet '{source}' contains duplicate sample id '{sample_id}' at $[{idx}]."
             )
         seen_ids.add(sample_id)
+
+        filepath = _resolve_and_check_readable_file(
+            str(item["filepath"]), "filepath", sample_id, source, base_dir=base_dir
+        )
+
+        index_val = item.get("index")
+        index_path: Path | None = None
+        if index_val is not None:
+            raw_idx = str(index_val)
+            if Path(raw_idx).suffix.lower() not in INDEX_SUFFIXES:
+                raise ValueError(
+                    f"Samplesheet '{source}' sample '{sample_id}' index '{raw_idx}' must end with .gzi, .bai, .csi, or .crai."
+                )
+            index_path = _resolve_and_check_readable_file(
+                raw_idx, "index", sample_id, source, base_dir=base_dir
+            )
+
         sex_val = item.get("sex")
         ff_val = item.get("ff")
         entries.append(
             SampleEntry(
                 id=sample_id,
-                filepath=Path(str(item["filepath"])),
+                filepath=filepath,
+                index=index_path,
                 sex=str(sex_val) if sex_val is not None else None,
                 ff=float(ff_val) if ff_val is not None else None,
             )
@@ -146,7 +194,9 @@ def load_samplesheet(
             f"Failed to parse samplesheet '{samplesheet_path}': {exc}"
         ) from exc
 
-    entries = validate_samplesheet_data(parsed, source=samplesheet_path)
+    entries = validate_samplesheet_data(
+        parsed, source=samplesheet_path, base_dir=samplesheet_path.parent
+    )
     if rng is not None:
         perm = rng.permutation(len(entries))
         return [entries[int(i)] for i in perm]
@@ -161,7 +211,9 @@ def write_samplesheet(
     """Serialize validated SampleEntry items to YAML or JSON."""
     payload = [entry.to_dict() for entry in entries]
     validate_samplesheet_data(
-        payload, source=outfile if outfile is not None else "<output>"
+        payload,
+        source=outfile if outfile is not None else "<output>",
+        base_dir=outfile.parent if outfile is not None else None,
     )
 
     fmt = default_format.lower()
@@ -321,13 +373,17 @@ def _read_alignment_external(
     mapq: int,
     reference: Path | None,
     target_chrs: frozenset[str],
+    index: Path | None = None,
 ) -> tuple[dict[str, int], dict[str, np.ndarray]]:
     """Read BAM/CRAM/SAM via pysam when available, falling back to samtools CLI."""
     if importlib.util.find_spec("pysam") is not None:
         import pysam
 
         ref_arg = str(reference) if reference is not None else None
-        with pysam.AlignmentFile(str(aln_path), reference_filename=ref_arg) as samfile:
+        idx_arg = str(index) if index is not None else None
+        with pysam.AlignmentFile(
+            str(aln_path), index_filename=idx_arg, reference_filename=ref_arg
+        ) as samfile:
             refs = [
                 (samfile.get_reference_name(i), int(samfile.lengths[i]))
                 for i in range(samfile.nreferences)
@@ -400,10 +456,13 @@ def read_alignment_bins(
     mapq: int,
     reference: Path | None,
     target_chrs: frozenset[str],
+    index: Path | None = None,
 ) -> tuple[dict[str, int], dict[str, np.ndarray]]:
     """Validate and bin aligned reads from a BAM, CRAM, or SAM file."""
     if not aln_path.is_file():
         raise FileNotFoundError(f"The file '{aln_path}' does not exist.")
+    if not os.access(aln_path, os.R_OK):
+        raise PermissionError(f"The file '{aln_path}' is not readable.")
     if binsize <= 0:
         raise ValueError("--binsize must be a positive integer.")
 
@@ -412,6 +471,16 @@ def read_alignment_bins(
         raise ValueError(
             f"Unsupported input file '{aln_path}'. Only aligned read files (.bam, .cram, .sam) are supported."
         )
+
+    if index is not None:
+        if index.suffix.lower() not in INDEX_SUFFIXES:
+            raise ValueError(
+                f"Unsupported index file '{index}'. Expected .gzi, .bai, .csi, or .crai."
+            )
+        if not index.is_file():
+            raise FileNotFoundError(f"The index file '{index}' does not exist.")
+        if not os.access(index, os.R_OK):
+            raise PermissionError(f"The index file '{index}' is not readable.")
 
     if suffix == ".bam" and importlib.util.find_spec("pysam") is None:
         return _read_bam_native(
@@ -423,6 +492,7 @@ def read_alignment_bins(
         mapq=mapq,
         reference=reference,
         target_chrs=target_chrs,
+        index=index,
     )
 
 
@@ -491,6 +561,7 @@ def _extract_sample_cn_profile(
     binsize: int,
     mapq: int,
     reference: Path | None,
+    index: Path | None = None,
 ) -> tuple[float, list[str], np.ndarray]:
     """Extract chrX copy-number ratio and autosomal log2 ratio features from an alignment file."""
     ref_lengths, bin_counts = read_alignment_bins(
@@ -499,6 +570,7 @@ def _extract_sample_cn_profile(
         mapq=mapq,
         reference=reference,
         target_chrs=CN_TARGET_CHRS,
+        index=index,
     )
     if "X" not in ref_lengths or "X" not in bin_counts:
         raise ValueError(
@@ -590,11 +662,11 @@ def parallel_load_samples[T, R](
 
 
 def _load_single_sample_alignment(
-    args: tuple[Path, int, int, Path | None],
+    args: tuple[Path, int, int, Path | None, Path | None],
 ) -> tuple[float, list[str], np.ndarray]:
-    filepath, binsize, mapq, reference = args
+    filepath, binsize, mapq, reference, index = args
     return _extract_sample_cn_profile(
-        filepath, binsize=binsize, mapq=mapq, reference=reference
+        filepath, binsize=binsize, mapq=mapq, reference=reference, index=index
     )
 
 
@@ -612,7 +684,8 @@ def load_training_dataset(
         raise ValueError("Samplesheet contains no samples.")
 
     items = [
-        (entry.id, (entry.filepath, binsize, mapq, reference)) for entry in entry_list
+        (entry.id, (entry.filepath, binsize, mapq, reference, entry.index))
+        for entry in entry_list
     ]
     loaded = parallel_load_samples(items, _load_single_sample_alignment, cpus=cpus)
 

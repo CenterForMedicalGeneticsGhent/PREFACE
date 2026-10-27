@@ -234,6 +234,7 @@ def test_samplesheet_lint_and_validation(tmp_path: Path) -> None:
     entries = load_samplesheet(example_sheet)
     assert len(entries) == 10
     assert entries[0].id == "ID_0"
+    assert entries[0].index is not None and entries[0].index.name == "sample.bam.bai"
     assert entries[0].sex == "M"
     assert entries[0].ff is not None and 0.0 <= entries[0].ff <= 1.0
 
@@ -246,31 +247,74 @@ def test_samplesheet_lint_and_validation(tmp_path: Path) -> None:
     assert loaded_json == entries
     assert runner.invoke(app, ["lint", str(json_sheet)]).exit_code == 0
 
+    valid_bam = tmp_path / "valid.bam"
+    valid_bam.write_bytes(b"BAM\x01")
+    for ext in (".gzi", ".bai", ".csi", ".crai"):
+        idx_file = tmp_path / f"valid{ext}"
+        idx_file.write_bytes(b"idx")
+        parsed_idx = validate_samplesheet_data(
+            [{"id": "S1", "filepath": str(valid_bam), "index": str(idx_file)}]
+        )
+        assert parsed_idx[0].index == idx_file
+
     # Test rejection of invalid schema inputs
     invalid_cases = [
         ([], "non-empty"),
         ([{"id": "S1"}], "'filepath' is a required property"),
-        ([{"id": "S1", "filepath": "a.bam", "sex": "X"}], "is not one of"),
+        ([{"id": "S1", "filepath": str(valid_bam), "sex": "X"}], "is not one of"),
         (
-            [{"id": "S1", "filepath": "a.bam", "ff": 1.5}],
+            [{"id": "S1", "filepath": str(valid_bam), "ff": 1.5}],
             "greater than the maximum of 1.0",
         ),
         (
-            [{"id": "S1", "filepath": "a.bam", "ff": -0.1}],
+            [{"id": "S1", "filepath": str(valid_bam), "ff": -0.1}],
             "less than the minimum of 0.0",
         ),
         (
-            [{"id": "S1", "filepath": "a.bam", "extra": 1}],
+            [{"id": "S1", "filepath": str(valid_bam), "index": "bad.idx"}],
+            "does not match",
+        ),
+        (
+            [{"id": "S1", "filepath": str(valid_bam), "extra": 1}],
             "Additional properties are not allowed",
         ),
         (
-            [{"id": "S1", "filepath": "a.bam"}, {"id": "S1", "filepath": "b.bam"}],
+            [
+                {"id": "S1", "filepath": str(valid_bam)},
+                {"id": "S1", "filepath": str(valid_bam)},
+            ],
             "duplicate sample id 'S1'",
         ),
     ]
     for payload, expected_err in invalid_cases:
         with pytest.raises(ValueError, match=expected_err):
             validate_samplesheet_data(payload)
+
+    # Test file existence and readability checks for filepath and index
+    with pytest.raises(FileNotFoundError, match="filepath .* does not exist"):
+        validate_samplesheet_data(
+            [{"id": "S1", "filepath": str(tmp_path / "missing.bam")}]
+        )
+
+    with pytest.raises(FileNotFoundError, match="index .* does not exist"):
+        validate_samplesheet_data(
+            [
+                {
+                    "id": "S1",
+                    "filepath": str(valid_bam),
+                    "index": str(tmp_path / "missing.bai"),
+                }
+            ]
+        )
+
+    unreadable_bam = tmp_path / "unreadable.bam"
+    unreadable_bam.write_bytes(b"BAM\x01")
+    unreadable_bam.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError, match="not readable"):
+            validate_samplesheet_data([{"id": "S1", "filepath": str(unreadable_bam)}])
+    finally:
+        unreadable_bam.chmod(0o644)
 
     bad_yaml = tmp_path / "bad.yaml"
     bad_yaml.write_text("- id: S1\n  filepath: a.bam\n  ff: 12.5\n", encoding="utf-8")

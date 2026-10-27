@@ -1,40 +1,41 @@
 - id: ID_0
-  filepath: /path/to/ID_0.bam
+  filepath: sample.bam
+  index: sample.bam.bai
   sex: M
   ff: 0.10470662
 - id: ID_1
-  filepath: /path/to/ID_1.bam
+  filepath: sample.bam
   sex: F
   ff: 0.0
 - id: ID_2
-  filepath: /path/to/ID_2.bam
+  filepath: sample.bam
   sex: M
   ff: 0.06507918
 - id: ID_5
-  filepath: /path/to/ID_5.bam
+  filepath: sample.bam
   sex: F
   ff: 0.0
 - id: ID_6
-  filepath: /path/to/ID_6.bam
+  filepath: sample.bam
   sex: F
   ff: 0.0
 - id: ID_9
-  filepath: /path/to/ID_9.bam
+  filepath: sample.bam
   sex: M
   ff: 0.11536387
 - id: ID_10
-  filepath: /path/to/ID_10.bam
+  filepath: sample.bam
   sex: M
   ff: 0.05697559
 - id: ID_11
-  filepath: /path/to/ID_11.bam
+  filepath: sample.bam
   sex: F
   ff: 0.0
 - id: ID_13
-  filepath: /path/to/ID_13.bam
+  filepath: sample.bam
   sex: M
   ff: 0.04406196
 - id: ID_14
-  filepath: /path/to/ID_14.bam
+  filepath: sample.bam
   sex: M
   ff: 0.08350878
