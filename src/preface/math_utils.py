@@ -280,3 +280,13 @@ def fit_lasso_fista(
     full_weights = np.zeros(n_bins, dtype=np.float64)
     full_weights[active] = scaled_beta
     return intercept, full_weights
+
+
+def format_stat(val: float) -> str:
+    """Format a scalar statistic to 15 significant digits or 'NA' when non-finite."""
+    return f"{val:.15g}" if np.isfinite(val) else "NA"
+
+
+def format_percentage(val: float) -> str:
+    """Format a 0..1 fraction as a percentage string for plain-text output."""
+    return f"{val * 100.0:.4g}%" if np.isfinite(val) else "NA"

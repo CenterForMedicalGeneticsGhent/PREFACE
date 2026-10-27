@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -11,6 +10,7 @@ import typer
 
 from preface import __version__
 from preface.logging_utils import LogLevel, configure_logging, get_logger
+from preface.pipeline import TrainTarget
 
 logger = get_logger(__name__)
 
@@ -91,6 +91,13 @@ def lint_cmd(
 
 @app.command("train")
 def train_cmd(
+    target: Annotated[
+        TrainTarget,
+        typer.Argument(
+            case_sensitive=False,
+            help="Training target: 'all' (unified FFY + PREFACE), 'ffy' (FFY only), or 'preface' / 'ffx' (PREFACE + FFX only).",
+        ),
+    ] = TrainTarget.ALL,
     samplesheet: Annotated[
         Path,
         typer.Option(
@@ -98,13 +105,15 @@ def train_cmd(
             "--samplesheet",
             help="Path to training samplesheet (.yaml, .yml, or .json).",
         ),
-    ],
-    outdir: Annotated[
+    ] = ...,
+    prefix: Annotated[
         Path,
         typer.Option(
-            "--outdir", help="Output directory for trained model.onnx and plots."
+            "-p",
+            "--prefix",
+            help="Output prefix for trained <prefix>.onnx model, samplesheet, statistics, and plots.",
         ),
-    ],
+    ] = ...,
     nfeat: Annotated[
         int,
         typer.Option(
@@ -150,182 +159,9 @@ def train_cmd(
         int,
         typer.Option(
             "--ffy-binsize",
-            help="Genomic bin width in base pairs on chrY when auto-estimating FFY.",
+            help="Genomic bin width in base pairs on chrY when training FFY.",
         ),
     ] = 5_000,
-    mapq: Annotated[
-        int,
-        typer.Option(
-            "--mapq",
-            help="Minimum mapping quality for aligned BAM/CRAM/SAM reads.",
-        ),
-    ] = 1,
-    reference: Annotated[
-        Path | None,
-        typer.Option(
-            "--reference",
-            help="Reference FASTA file path for CRAM alignment decoding.",
-        ),
-    ] = None,
-    male_ref: Annotated[
-        list[Path] | None,
-        typer.Option(
-            "--male-ref",
-            help="Paths to 100% male reference BAM/CRAM/SAM samples when auto-estimating FFY.",
-        ),
-    ] = None,
-    device: Annotated[
-        str,
-        typer.Option("--device", help="Compute device to use (auto, cpu, cuda, mps)."),
-    ] = "auto",
-    seed: Annotated[
-        int,
-        typer.Option("--seed", help="Random seed for reproducibility."),
-    ] = 1,
-    loglevel: LogLevelOption = None,
-) -> None:
-    """Train a PREFACE model from aligned reads and export it to ONNX."""
-    from preface.pipeline import run_train
-
-    if loglevel is not None:
-        configure_logging(loglevel)
-
-    try:
-        run_train(
-            samplesheet_path=samplesheet,
-            outdir=outdir,
-            n_feat=nfeat,
-            hidden=hidden,
-            cpus=cpus,
-            femprop=femprop,
-            olm=olm,
-            noskewcorrect=noskewcorrect,
-            binsize=binsize,
-            ffy_binsize=ffy_binsize,
-            mapq=mapq,
-            reference=reference,
-            male_ref_paths=male_ref,
-            device_name=device,
-            seed=seed,
-        )
-    except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-        logger.error("%s", exc)
-        raise typer.Exit(code=1) from exc
-
-
-@app.command("predict")
-def predict_cmd(
-    infile: Annotated[
-        Path,
-        typer.Option(
-            "--infile", help="Path to sample aligned read file (.bam, .cram, .sam)."
-        ),
-    ],
-    model: Annotated[
-        Path,
-        typer.Option("--model", help="Path to trained model.onnx file."),
-    ],
-    mapq: Annotated[
-        int,
-        typer.Option(
-            "--mapq",
-            help="Minimum mapping quality for aligned BAM/CRAM/SAM reads.",
-        ),
-    ] = 1,
-    reference: Annotated[
-        Path | None,
-        typer.Option(
-            "--reference",
-            help="Reference FASTA file path for CRAM alignment decoding.",
-        ),
-    ] = None,
-    json_out: Annotated[
-        str | None,
-        typer.Option(
-            "--json",
-            help="Output predictions in JSON format. Pass empty string '' (or bare --json) for stdout, or a file path.",
-        ),
-    ] = None,
-    device: Annotated[
-        str,
-        typer.Option(
-            "--device", help="Execution device for ONNX Runtime (auto, cpu, cuda, mps)."
-        ),
-    ] = "auto",
-    loglevel: LogLevelOption = None,
-) -> None:
-    """Predict fetal fraction (FFX and PREFACE) for an aligned read file using a trained ONNX model."""
-    from preface.pipeline import run_predict
-
-    if loglevel is not None:
-        configure_logging(loglevel)
-
-    try:
-        run_predict(
-            infile=infile,
-            model_path=model,
-            mapq=mapq,
-            reference=reference,
-            json_arg=json_out,
-            device_name=device,
-        )
-    except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
-        logger.error("%s", exc)
-        raise typer.Exit(code=1) from exc
-
-
-@app.command("ffy")
-def ffy_cmd(
-    samplesheet: Annotated[
-        Path | None,
-        typer.Option(
-            "-s",
-            "--samplesheet",
-            help="Path to cohort samplesheet (.yaml, .yml, or .json).",
-        ),
-    ] = None,
-    infile: Annotated[
-        Path | None,
-        typer.Option(
-            "--infile",
-            help="Path to single-sample BAM/CRAM/SAM alignment file.",
-        ),
-    ] = None,
-    outfile: Annotated[
-        Path | None,
-        typer.Option(
-            "--outfile",
-            help="Output path for generated samplesheet (.yaml, .yml, or .json; defaults to stdout).",
-        ),
-    ] = None,
-    model: Annotated[
-        Path | None,
-        typer.Option(
-            "--model",
-            help="Path to calibrated FFY ONNX model for single-sample inference.",
-        ),
-    ] = None,
-    save_model: Annotated[
-        Path | None,
-        typer.Option(
-            "--save-model",
-            help="Output path to save calibrated FFY Lasso ONNX model in cohort mode.",
-        ),
-    ] = None,
-    male_ref: Annotated[
-        list[Path] | None,
-        typer.Option(
-            "--male-ref",
-            help="Paths to 100% male reference BAM/CRAM/SAM samples (LBs) per PMC6771918 Eq. 1.",
-        ),
-    ] = None,
-    binsize: Annotated[
-        int,
-        typer.Option(
-            "--binsize",
-            help="Bin width in base pairs when binning aligned BAM/CRAM/SAM reads.",
-        ),
-    ] = 5000,
     mapq: Annotated[
         int,
         typer.Option(
@@ -347,6 +183,13 @@ def ffy_cmd(
             help="Lasso regularization penalty lambda for chrY bin weighting (PMC6771918 Eq. 3).",
         ),
     ] = 1e-4,
+    no_female_gate: Annotated[
+        bool,
+        typer.Option(
+            "--no-female-gate",
+            help="Disable gating FFY predictions to 0.0 for female samples.",
+        ),
+    ] = False,
     reference: Annotated[
         Path | None,
         typer.Option(
@@ -354,23 +197,23 @@ def ffy_cmd(
             help="Reference FASTA file path for CRAM alignment decoding.",
         ),
     ] = None,
-    json_out: Annotated[
-        str | None,
+    male_ref: Annotated[
+        list[Path] | None,
         typer.Option(
-            "--json",
-            help="Output single-sample FFY in JSON format. Pass bare --json for stdout, or a file path.",
+            "--male-ref",
+            help="Paths to 100% male reference BAM/CRAM/SAM samples (LBs) when training FFY.",
         ),
     ] = None,
-    cpus: Annotated[
-        int,
-        typer.Option("--cpus", help="Number of CPU threads for parallel processing."),
-    ] = os.cpu_count() or 1,
+    cache_counts: Annotated[
+        Path | None,
+        typer.Option(
+            "--cache-counts",
+            help="Optional .npz file path to save/reuse single-pass binned read counts.",
+        ),
+    ] = None,
     device: Annotated[
         str,
-        typer.Option(
-            "--device",
-            help="Execution device for ONNX Runtime (auto, cpu, cuda, mps).",
-        ),
+        typer.Option("--device", help="Compute device to use (auto, cpu, cuda, mps)."),
     ] = "auto",
     seed: Annotated[
         int,
@@ -378,65 +221,112 @@ def ffy_cmd(
     ] = 1,
     loglevel: LogLevelOption = None,
 ) -> None:
-    """Calculate baseline chromosome Y fetal fraction (FFY) and sex from aligned reads."""
-    from preface.ffy import run_ffy_cohort, run_ffy_single
+    """Train FFY, PREFACE/FFX, or unified FFY+PREFACE models in a single pass and export to ONNX."""
+    from preface.pipeline import run_train
 
     if loglevel is not None:
         configure_logging(loglevel)
 
     try:
-        if (samplesheet is None) == (infile is None):
-            raise ValueError(
-                "Provide exactly one of -s/--samplesheet (cohort mode) or --infile (single-sample mode)."
-            )
-        if samplesheet is not None:
-            run_ffy_cohort(
-                samplesheet_path=samplesheet,
-                outfile=outfile,
-                male_ref_paths=male_ref,
-                save_model_path=save_model,
-                binsize=binsize,
-                mapq=mapq,
-                yfrac=yfrac,
-                lasso_lambda=lasso_lambda,
-                reference=reference,
-                cpus=cpus,
-                seed=seed,
-            )
-        elif infile is not None:
-            run_ffy_single(
-                infile=infile,
-                model_path=model,
-                binsize=binsize,
-                mapq=mapq,
-                yfrac=yfrac,
-                reference=reference,
-                json_arg=json_out,
-                device_name=device,
-            )
+        run_train(
+            samplesheet_path=samplesheet,
+            prefix=prefix,
+            target=target,
+            n_feat=nfeat,
+            hidden=hidden,
+            cpus=cpus,
+            femprop=femprop,
+            olm=olm,
+            noskewcorrect=noskewcorrect,
+            binsize=binsize,
+            ffy_binsize=ffy_binsize,
+            mapq=mapq,
+            yfrac=yfrac,
+            lasso_lambda=lasso_lambda,
+            no_female_gate=no_female_gate,
+            reference=reference,
+            male_ref_paths=male_ref,
+            cache_counts=cache_counts,
+            device_name=device,
+            seed=seed,
+        )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
         logger.error("%s", exc)
         raise typer.Exit(code=1) from exc
 
 
-def _normalize_argv(argv: list[str]) -> list[str]:
-    """Support PREFACE's bare `--json` flag (without value) alongside `--json path/to/file.json`."""
-    normalized: list[str] = []
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--json" and (i + 1 >= len(argv) or argv[i + 1].startswith("-")):
-            normalized.extend(["--json", ""])
-            i += 1
-            continue
-        normalized.append(arg)
-        i += 1
-    return normalized
+@app.command("predict")
+def predict_cmd(
+    infile: Annotated[
+        Path,
+        typer.Option(
+            "--infile", help="Path to sample aligned read file (.bam, .cram, .sam)."
+        ),
+    ],
+    model: Annotated[
+        Path,
+        typer.Option("--model", help="Path to trained .onnx model file."),
+    ],
+    prefix: Annotated[
+        Path | None,
+        typer.Option(
+            "-p",
+            "--prefix",
+            help="Output prefix for JSON predictions (0..1 floats). Omit to print plain-text percentages to stdout.",
+        ),
+    ] = None,
+    mapq: Annotated[
+        int,
+        typer.Option(
+            "--mapq",
+            help="Minimum mapping quality for aligned BAM/CRAM/SAM reads.",
+        ),
+    ] = 1,
+    reference: Annotated[
+        Path | None,
+        typer.Option(
+            "--reference",
+            help="Reference FASTA file path for CRAM alignment decoding.",
+        ),
+    ] = None,
+    no_female_gate: Annotated[
+        bool | None,
+        typer.Option(
+            "--no-female-gate/--female-gate",
+            help="Disable or enable gating FFY predictions to 0.0 for female samples (defaults to model setting).",
+        ),
+    ] = None,
+    device: Annotated[
+        str,
+        typer.Option(
+            "--device", help="Execution device for ONNX Runtime (auto, cpu, cuda, mps)."
+        ),
+    ] = "auto",
+    loglevel: LogLevelOption = None,
+) -> None:
+    """Predict fetal fraction (sex, FFY, FFX, and PREFACE) for an aligned read file using an ONNX model."""
+    from preface.pipeline import run_predict
+
+    if loglevel is not None:
+        configure_logging(loglevel)
+
+    try:
+        run_predict(
+            infile=infile,
+            model_path=model,
+            prefix=prefix,
+            mapq=mapq,
+            reference=reference,
+            no_female_gate=no_female_gate,
+            device_name=device,
+        )
+    except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+        logger.error("%s", exc)
+        raise typer.Exit(code=1) from exc
 
 
 def main() -> None:
-    """CLI entrypoint normalizing optional flag arguments."""
-    sys.argv[1:] = _normalize_argv(sys.argv[1:])
+    """CLI entrypoint."""
     app()
 
 

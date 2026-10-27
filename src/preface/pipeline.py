@@ -2,29 +2,45 @@
 
 from __future__ import annotations
 
+import json
 import time
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from preface.ffy import estimate_cohort_ffy
+from preface.ffy import (
+    FFYTrainingResult,
+    fit_cohort_ffy_from_profiles,
+    format_ffy_statistics_lines,
+)
 from preface.hardware import configure_hardware, resolve_device
 from preface.io import (
-    emit_prediction_output,
-    load_inference_alignment,
+    SAMPLESHEET_SUFFIXES,
+    align_to_loci,
+    build_training_dataset_from_unified,
+    extract_unified_sample,
+    load_cohort_unified_data,
     load_samplesheet,
-    load_training_dataset,
+    write_samplesheet,
 )
 from preface.logging_utils import get_logger
-from preface.math_utils import ols_fit, pca_irlba_torch, rlm_huber
+from preface.math_utils import format_stat, ols_fit, pca_irlba_torch, rlm_huber
 from preface.models import (
+    MODEL_TYPE_ALL,
+    MODEL_TYPE_FFY,
+    MODEL_TYPE_PREFACE,
+    UnifiedPredictionResult,
+    export_ffy_model_to_onnx,
     export_pipeline_to_onnx,
+    export_unified_pipeline_to_onnx,
     fit_predictor,
     load_onnx_metadata,
     predict_model,
-    run_onnx_inference,
+    run_unified_onnx_inference,
 )
 
 if TYPE_CHECKING:
@@ -33,10 +49,88 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def _format_stat(val: float) -> str:
-    if not np.isfinite(val):
-        return "NA"
-    return f"{val:.15g}"
+class TrainTarget(StrEnum):
+    """Supported training targets for `preface train`."""
+
+    ALL = "all"
+    FFY = "ffy"
+    PREFACE = "preface"
+    FFX = "ffx"
+
+
+@dataclass(frozen=True)
+class PrefixPaths:
+    """Resolved output paths derived from a CLI --prefix argument."""
+
+    onnx_path: Path
+    samplesheet_path: Path
+    training_stats_path: Path
+    ffy_stats_path: Path
+    overall_plot_path: Path
+    ffx_plot_path: Path
+    repeats_dir: Path
+    predict_json_path: Path
+
+
+def resolve_prefix_paths(
+    prefix: Path | str, samplesheet_suffix: str = ".yaml"
+) -> PrefixPaths:
+    """Resolve output artifact paths from a file prefix or directory path."""
+    raw = str(prefix)
+    p = Path(raw)
+    ext = (
+        samplesheet_suffix
+        if samplesheet_suffix.lower() in SAMPLESHEET_SUFFIXES
+        else ".yaml"
+    )
+    if raw.endswith(("/", "\\")) or (p.exists() and p.is_dir()):
+        p.mkdir(parents=True, exist_ok=True)
+        return PrefixPaths(
+            p / "model.onnx",
+            p / f"samplesheet{ext}",
+            p / "training_statistics.txt",
+            p / "ffy_statistics.txt",
+            p / "overall_performance.png",
+            p / "FFX.png",
+            p / "training_repeats",
+            p / "predictions.json",
+        )
+    base = next(
+        (
+            raw[: -len(s)]
+            for s in (".onnx", ".json", ".yaml", ".yml")
+            if raw.lower().endswith(s) and len(raw) > len(s)
+        ),
+        raw,
+    )
+    Path(base).parent.mkdir(parents=True, exist_ok=True)
+    return PrefixPaths(
+        p if raw.lower().endswith(".onnx") else Path(f"{base}.onnx"),
+        Path(f"{base}.samplesheet{ext}"),
+        Path(f"{base}.training_statistics.txt"),
+        Path(f"{base}.ffy_statistics.txt"),
+        Path(f"{base}.overall_performance.png"),
+        Path(f"{base}.FFX.png"),
+        Path(f"{base}.training_repeats"),
+        p if raw.lower().endswith(".json") else Path(f"{base}.json"),
+    )
+
+
+def emit_prediction_output(
+    text_lines: list[str],
+    json_dict: dict[str, str | float],
+    prefix: Path | str | None = None,
+) -> None:
+    """Write prediction results as JSON to <prefix>.json or plain-text percentages to stdout."""
+    if prefix is None:
+        for line in text_lines:
+            print(line)
+        return
+    paths = resolve_prefix_paths(prefix)
+    payload = json.dumps(json_dict, indent=2) + "\n"
+    paths.predict_json_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.predict_json_path.write_text(payload, encoding="utf-8")
+    logger.info("Wrote predictions to '%s'", paths.predict_json_path)
 
 
 def _run_cross_validation(
@@ -107,7 +201,7 @@ def _run_cross_validation(
 
 def _write_training_statistics(
     stats_path: Path,
-    outdir_str: str,
+    overall_plot_path: Path,
     predictions: np.ndarray,
     labeled_ff: np.ndarray,
     labeled_ids: list[str],
@@ -115,8 +209,9 @@ def _write_training_statistics(
     the_intercept: float,
     the_slope: float,
     elapsed_seconds: int,
+    ffy_result: FFYTrainingResult | None = None,
 ) -> None:
-    """Format and write training_statistics.txt."""
+    """Format and write training_statistics.txt (including FFY stats when trained together)."""
     index_10 = labeled_ff < (0.20 - predictions)
     deviations_10 = np.abs(predictions[index_10] - labeled_ff[index_10])
     mae_10 = float(np.mean(deviations_10)) if deviations_10.size > 0 else float("nan")
@@ -129,6 +224,10 @@ def _write_training_statistics(
     outlier_indices = np.flatnonzero(deviations > outlier_threshold)
 
     lines: list[str] = ["PREFACE - PREdict FetAl ComponEnt", ""]
+    if ffy_result is not None:
+        lines.extend(format_ffy_statistics_lines(ffy_result))
+        lines.append("")
+
     if outlier_indices.size > 0:
         lines.extend(
             [
@@ -144,32 +243,34 @@ def _write_training_statistics(
         outlier_signed_vals = (predictions - labeled_ff)[outlier_indices]
         for idx in np.argsort(outlier_abs_vals)[::-1]:
             sample_id = labeled_ids[int(outlier_indices[idx])]
-            lines.append(f"{sample_id}\t{_format_stat(outlier_signed_vals[idx])}")
+            lines.append(f"{sample_id}\t{format_stat(outlier_signed_vals[idx])}")
         lines.extend(["_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_", ""])
 
     lines.extend(
         [
             f"Training time: {elapsed_seconds} seconds",
-            f"Overall correlation (r): {_format_stat(metrics.cor)}",
-            f"Overall mean absolute error (MAE): {_format_stat(metrics.mae)} ± {_format_stat(metrics.sd_diff)}",
-            f"FF < 0.1 mean absolute error (MAE): {_format_stat(mae_10)} ± {_format_stat(sd_10)}",
+            f"Overall correlation (r): {format_stat(metrics.cor)}",
+            f"Overall mean absolute error (MAE): {format_stat(metrics.mae)} ± {format_stat(metrics.sd_diff)}",
+            f"FF < 0.1 mean absolute error (MAE): {format_stat(mae_10)} ± {format_stat(sd_10)}",
             "Correction for skew: ",
-            f"\tIntercept: {_format_stat(the_intercept)}",
-            f"\tSlope: {_format_stat(the_slope)}",
+            f"\tIntercept: {format_stat(the_intercept)}",
+            f"\tSlope: {format_stat(the_slope)}",
             "",
             (
                 f"Do not forget to verify whether the '--nfeat' parameter captures the first 'random' phase "
-                f"(and not too much of the 'non-random' phase) at '{outdir_str}overall_performance.png'.\n"
+                f"(and not too much of the 'non-random' phase) at '{overall_plot_path.as_posix()}'.\n"
                 "If you believe this parameter is not located in an optimal position, decrease/increase '--nfeat' and re-run."
             ),
         ]
     )
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def run_train(
     samplesheet_path: Path,
-    outdir: Path,
+    prefix: Path | str,
+    target: TrainTarget | str = TrainTarget.ALL,
     n_feat: int = 50,
     hidden: int = 2,
     cpus: int = 1,
@@ -179,43 +280,115 @@ def run_train(
     binsize: int = 100_000,
     ffy_binsize: int = 5_000,
     mapq: int = 1,
+    yfrac: float | None = None,
+    lasso_lambda: float = 1e-4,
+    no_female_gate: bool = False,
     reference: Path | None = None,
     male_ref_paths: list[Path] | None = None,
+    cache_counts: Path | None = None,
     device_name: str = "auto",
     seed: int = 1,
 ) -> Path:
-    """Execute the full PREFACE training workflow and export model.onnx."""
+    """Execute the single-pass FFY and/or PREFACE training workflow and export <prefix>.onnx."""
     from preface.plotting import plot_ffx, plot_performance
 
     start_time = time.perf_counter()
+    resolved_target = TrainTarget(str(target).lower())
+    run_ffy = resolved_target in {TrainTarget.ALL, TrainTarget.FFY}
+    run_preface = resolved_target in {
+        TrainTarget.ALL,
+        TrainTarget.PREFACE,
+        TrainTarget.FFX,
+    }
 
     raw_entries = load_samplesheet(samplesheet_path)
-
-    outdir.mkdir(parents=True, exist_ok=True)
-    if not outdir.is_dir():
-        raise OSError(f"Could not create directory '{outdir}'.")
+    paths = resolve_prefix_paths(
+        prefix, samplesheet_suffix=samplesheet_path.suffix.lower()
+    )
 
     resolved_cpus = configure_hardware(cpus=cpus, seed=seed)
     device = resolve_device(device_name)
     rng = np.random.default_rng(seed)
 
     train_sexes = {"M", "F"} if femprop else {"M"}
-    needs_ffy = any(
-        e.sex is None or (e.sex in train_sexes and e.ff is None) for e in raw_entries
-    )
-    if needs_ffy:
-        logger.info(
-            "Samplesheet has missing sex or ff values; estimating cohort FFY ..."
+    if not run_ffy:
+        missing_labels = any(
+            e.sex is None or (e.sex in train_sexes and e.ff is None)
+            for e in raw_entries
         )
-        raw_entries = estimate_cohort_ffy(
+        if missing_labels:
+            raise ValueError(
+                "Samplesheet has missing 'sex' or 'ff' labels required for 'preface train preface'. "
+                "Run 'preface train all' or 'preface train ffy' first to populate baseline FFY labels."
+            )
+
+    logger.info(
+        "Reading %d cohort sample(s) in a single pass (include_ffy=%s, include_cn=%s) ...",
+        len(raw_entries),
+        run_ffy,
+        run_preface,
+    )
+    unified_samples, lb_profiles = load_cohort_unified_data(
+        entries=raw_entries,
+        binsize=binsize,
+        ffy_binsize=ffy_binsize,
+        mapq=mapq,
+        reference=reference,
+        male_ref_paths=male_ref_paths,
+        cpus=resolved_cpus,
+        include_cn=run_preface,
+        include_ffy=run_ffy,
+        cache_counts=cache_counts,
+    )
+
+    ffy_result: FFYTrainingResult | None = None
+    if run_ffy:
+        cohort_y_profiles = [
+            s.y_profile for s in unified_samples if s.y_profile is not None
+        ]
+        ffy_result = fit_cohort_ffy_from_profiles(
             entries=raw_entries,
-            male_ref_paths=male_ref_paths,
+            cohort_profiles=cohort_y_profiles,
+            lb_profiles=lb_profiles,
             binsize=ffy_binsize,
-            mapq=mapq,
-            reference=reference,
-            cpus=resolved_cpus,
+            yfrac=yfrac,
+            lasso_lambda=lasso_lambda,
+            no_female_gate=no_female_gate,
             seed=seed,
         )
+        raw_entries = ffy_result.entries
+        default_fmt = "json" if samplesheet_path.suffix.lower() == ".json" else "yaml"
+        write_samplesheet(
+            raw_entries,
+            outfile=paths.samplesheet_path,
+            default_format=default_fmt,
+        )
+
+        if not run_preface:
+            elapsed_ffy = round(time.perf_counter() - start_time)
+            ffy_lines = format_ffy_statistics_lines(ffy_result) + [
+                f"Training time: {elapsed_ffy} seconds",
+            ]
+            paths.ffy_stats_path.parent.mkdir(parents=True, exist_ok=True)
+            paths.ffy_stats_path.write_text("\n".join(ffy_lines), encoding="utf-8")
+            export_ffy_model_to_onnx(
+                intercept=ffy_result.intercept,
+                weights=ffy_result.weights,
+                bin_loci=ffy_result.bin_loci,
+                informative_indices=ffy_result.informative_indices,
+                female_baseline=ffy_result.female_baseline,
+                male_100_baseline=ffy_result.male_100_baseline,
+                yfrac_threshold=ffy_result.yfrac_threshold,
+                binsize=ffy_result.binsize,
+                onnx_path=paths.onnx_path,
+                no_female_gate=no_female_gate,
+            )
+            logger.info(
+                "Finished FFY training! Consult '%s' and '%s'.",
+                paths.ffy_stats_path,
+                paths.samplesheet_path,
+            )
+            return paths.onnx_path
 
     perm = rng.permutation(len(raw_entries))
     entries = [raw_entries[int(i)] for i in perm]
@@ -234,18 +407,13 @@ def run_train(
     if n_labeled < n_feat:
         raise ValueError(f"Please provide at least {n_feat} labeled samples.")
 
-    dataset = load_training_dataset(
-        entries=entries,
-        binsize=binsize,
-        mapq=mapq,
-        reference=reference,
-        cpus=resolved_cpus,
+    dataset = build_training_dataset_from_unified(
+        entries=entries, unified_samples=unified_samples
     )
     training_frame = dataset.training_frame
     ids_all = [e.id for e in entries]
 
-    repeats_dir = outdir / "training_repeats"
-    repeats_dir.mkdir(parents=True, exist_ok=True)
+    paths.repeats_dir.mkdir(parents=True, exist_ok=True)
 
     repeats = 10
     max_feat = n_labeled - int(n_labeled / repeats) - 1
@@ -267,7 +435,7 @@ def run_train(
         hidden=hidden,
         olm=olm,
         device=device,
-        repeats_dir=repeats_dir,
+        repeats_dir=paths.repeats_dir,
         repeats=repeats,
     )
     labeled_ff = ff_all[labeled_indices]
@@ -286,7 +454,12 @@ def run_train(
     v2_male_x = dataset.x_ratios[male_mask]
     the_intercept_x, the_slope_x, wr = rlm_huber(v1_male_ff, v2_male_x)
     plot_ffx(
-        v1_male_ff, v2_male_x, the_intercept_x, the_slope_x, wr, outdir / "FFX.png"
+        v1_male_ff,
+        v2_male_x,
+        the_intercept_x,
+        the_slope_x,
+        wr,
+        paths.ffx_plot_path,
     )
 
     predictions = the_intercept + the_slope * predictions
@@ -312,13 +485,12 @@ def run_train(
         n_feat,
         "PREFACE",
         "FF",
-        outdir / "overall_performance.png",
+        paths.overall_plot_path,
     )
 
-    outdir_str = f"{outdir.as_posix().rstrip('/')}/"
     _write_training_statistics(
-        stats_path=outdir / "training_statistics.txt",
-        outdir_str=outdir_str,
+        stats_path=paths.training_stats_path,
+        overall_plot_path=paths.overall_plot_path,
         predictions=predictions,
         labeled_ff=labeled_ff,
         labeled_ids=[ids_all[i] for i in labeled_indices],
@@ -326,65 +498,128 @@ def run_train(
         the_intercept=the_intercept,
         the_slope=the_slope,
         elapsed_seconds=round(time.perf_counter() - start_time),
+        ffy_result=ffy_result,
     )
 
-    onnx_path = outdir / "model.onnx"
-    export_pipeline_to_onnx(
-        predictor=final_model,
-        mean_features=dataset.mean_features,
-        pca_center=pca_final.center,
-        pca_rotation=pca_final.rotation[:, :n_feat],
-        the_intercept=the_intercept,
-        the_slope=the_slope,
-        the_intercept_x=the_intercept_x,
-        the_slope_x=the_slope_x,
-        possible_features=dataset.possible_features,
-        onnx_path=onnx_path,
-        binsize=binsize,
-    )
+    if ffy_result is not None:
+        export_unified_pipeline_to_onnx(
+            predictor=final_model,
+            mean_features=dataset.mean_features,
+            pca_center=pca_final.center,
+            pca_rotation=pca_final.rotation[:, :n_feat],
+            the_intercept=the_intercept,
+            the_slope=the_slope,
+            the_intercept_x=the_intercept_x,
+            the_slope_x=the_slope_x,
+            possible_features=dataset.possible_features,
+            ffy_intercept=ffy_result.intercept,
+            ffy_weights=ffy_result.weights,
+            bin_loci=ffy_result.bin_loci,
+            informative_indices=ffy_result.informative_indices,
+            female_baseline=ffy_result.female_baseline,
+            male_100_baseline=ffy_result.male_100_baseline,
+            yfrac_threshold=ffy_result.yfrac_threshold,
+            onnx_path=paths.onnx_path,
+            binsize=binsize,
+            ffy_binsize=ffy_binsize,
+            no_female_gate=no_female_gate,
+        )
+    else:
+        export_pipeline_to_onnx(
+            predictor=final_model,
+            mean_features=dataset.mean_features,
+            pca_center=pca_final.center,
+            pca_rotation=pca_final.rotation[:, :n_feat],
+            the_intercept=the_intercept,
+            the_slope=the_slope,
+            the_intercept_x=the_intercept_x,
+            the_slope_x=the_slope_x,
+            possible_features=dataset.possible_features,
+            onnx_path=paths.onnx_path,
+            binsize=binsize,
+        )
 
     logger.info(
-        "Finished! Consult '%straining_statistics.txt' to analyse your model's performance.",
-        outdir_str,
+        "Finished! Consult '%s' to analyse your model's performance.",
+        paths.training_stats_path,
     )
-    return onnx_path
+    return paths.onnx_path
 
 
 def run_predict(
     infile: Path,
     model_path: Path,
+    prefix: Path | str | None = None,
     mapq: int = 1,
     reference: Path | None = None,
-    json_arg: str | None = None,
+    no_female_gate: bool | None = None,
     device_name: str = "auto",
-) -> tuple[float, float]:
-    """Run PREFACE prediction on a single sample alignment file using a trained ONNX model."""
+) -> UnifiedPredictionResult:
+    """Run unified FFY / FFX / PREFACE prediction on a single alignment file using an ONNX model."""
     if not infile.is_file():
         raise FileNotFoundError(f"The file '{infile}' does not exist.")
     if not model_path.is_file():
         raise FileNotFoundError(f"The file '{model_path}' does not exist.")
 
-    logger.debug("Loading PREFACE ONNX model from '%s'", model_path)
+    logger.debug("Loading ONNX model from '%s'", model_path)
     meta = load_onnx_metadata(model_path)
-    sample_data = load_inference_alignment(
+
+    need_cn = meta.model_type in {MODEL_TYPE_ALL, MODEL_TYPE_PREFACE}
+    need_ffy = meta.model_type in {MODEL_TYPE_ALL, MODEL_TYPE_FFY}
+
+    unified_sample = extract_unified_sample(
         infile,
-        meta.possible_features,
+        sample_id=infile.name,
         binsize=meta.binsize,
+        ffy_binsize=meta.ffy_binsize,
         mapq=mapq,
         reference=reference,
+        include_cn=need_cn,
+        include_ffy=need_ffy,
     )
 
-    ffx = (sample_data.x_ratio - meta.the_intercept_x) / meta.the_slope_x
-    prediction = run_onnx_inference(
+    selected_ratios: np.ndarray | None = None
+    if need_cn:
+        assert unified_sample.feature_loci is not None
+        assert unified_sample.feature_ratios is not None
+        selected_ratios = align_to_loci(
+            unified_sample.feature_loci,
+            unified_sample.feature_ratios,
+            meta.possible_features,
+        )
+
+    aligned_y: np.ndarray | None = None
+    if need_ffy:
+        assert unified_sample.y_profile is not None
+        aligned_y = align_to_loci(
+            unified_sample.y_profile.bin_loci,
+            unified_sample.y_profile.y_norm_bins,
+            meta.bin_loci,
+            fill_nan=0.0,
+        )
+
+    result = run_unified_onnx_inference(
         onnx_path=model_path,
-        feature_ratios=sample_data.feature_ratios,
+        meta=meta,
+        feature_ratios=selected_ratios,
+        x_ratio=unified_sample.x_ratio,
+        aligned_y=aligned_y,
         requested_device=device_name,
+        no_female_gate_override=no_female_gate,
     )
-    logger.debug("Predicted FFX=%.6f, PREFACE=%.6f for '%s'", ffx, prediction, infile)
+
+    logger.debug(
+        "Predicted sex=%s, FFY=%s, FFX=%s, PREFACE=%s for '%s'",
+        result.sex,
+        result.ffy,
+        result.ffx,
+        result.preface,
+        infile,
+    )
 
     emit_prediction_output(
-        [f"FFX = {ffx:.4g}", f"PREFACE = {prediction:.4g}"],
-        {"FFX": ffx, "PREFACE": prediction},
-        json_arg,
+        result.to_text_lines(),
+        result.to_json_dict(),
+        prefix=prefix,
     )
-    return ffx, prediction
+    return result
