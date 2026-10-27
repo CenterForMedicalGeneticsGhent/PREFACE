@@ -2,34 +2,28 @@
 
 from __future__ import annotations
 
-import importlib.util
-import shutil
-import struct
-import subprocess
-import zlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 import numpy as np
-import polars as pl
 
-from preface import EXCLUDE_CHRS
 from preface.io import (
-    NA_VALUES,
+    FFY_TARGET_CHRS,
+    SampleEntry,
+    compute_autosomal_density,
     emit_prediction_output,
-    open_text_file,
+    load_samplesheet,
     parallel_load_samples,
+    read_alignment_bins,
+    write_samplesheet,
 )
 from preface.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-AUTOSOME_CHRS: frozenset[str] = frozenset(str(i) for i in range(1, 23)) - EXCLUDE_CHRS
 CHRY_PAR1_END: int = 2_781_479
 CHRY_HETEROCHROMATIN_START: int = 28_800_000
-SKIP_BAM_FLAGS: int = 0x4 | 0x100 | 0x200 | 0x400 | 0x800
-ALIGNMENT_SUFFIXES: frozenset[str] = frozenset({".bam", ".cram", ".sam"})
 
 
 @dataclass(frozen=True)
@@ -40,16 +34,6 @@ class SampleYProfile:
     bin_starts: np.ndarray
     bin_ends: np.ndarray
     y_norm_bins: np.ndarray
-
-
-def _normalize_chr(raw: str) -> str:
-    cleaned = raw.strip()
-    if cleaned.lower().startswith("chr"):
-        cleaned = cleaned[3:]
-    upper = cleaned.upper()
-    if upper in {"X", "Y", "M", "MT"}:
-        return "M" if upper == "MT" else upper
-    return cleaned
 
 
 def _coordinate_informative_mask(starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
@@ -63,399 +47,54 @@ def _coordinate_informative_mask(starts: np.ndarray, ends: np.ndarray) -> np.nda
     return np.ones(starts.size, dtype=bool)
 
 
-def _compute_y_profile_from_bins(
-    auto_starts: np.ndarray,
-    auto_ends: np.ndarray,
-    auto_counts: np.ndarray,
-    y_starts: np.ndarray,
-    y_ends: np.ndarray,
-    y_counts: np.ndarray,
-) -> SampleYProfile:
-    """Normalize chromosome Y bin counts by mean mappable diploid autosomal read density."""
-    if y_counts.size == 0:
-        raise ValueError("Input contains no chromosome Y bins.")
-    if np.any(auto_counts < 0) or np.any(y_counts < 0):
-        raise ValueError(
-            "Input contains negative bin values. Provide raw/binned read counts rather than log2 ratios."
-        )
-
-    auto_widths = np.maximum(1, auto_ends - auto_starts).astype(np.float64)
-    valid_auto = np.isfinite(auto_counts) & (auto_counts > 0)
-    if not np.any(valid_auto):
-        raise ValueError(
-            "Input contains no positive autosomal read counts for normalization."
-        )
-
-    r_auto = float(np.mean(auto_counts[valid_auto] / auto_widths[valid_auto]))
-    if r_auto <= 0.0 or not np.isfinite(r_auto):
-        raise ValueError("Computed autosomal read density is non-positive.")
-
-    order = np.argsort(y_starts, kind="mergesort")
-    y_starts_sorted = y_starts[order].astype(np.int64, copy=False)
-    y_ends_sorted = y_ends[order].astype(np.int64, copy=False)
-    y_counts_sorted = y_counts[order].astype(np.float64, copy=False)
-
-    y_widths = np.maximum(1, y_ends_sorted - y_starts_sorted).astype(np.float64)
-    y_norm = np.where(
-        np.isfinite(y_counts_sorted),
-        y_counts_sorted / (r_auto * y_widths),
-        np.nan,
-    )
-    bin_loci = [f"Y:{int(s)}-{int(e)}" for s, e in zip(y_starts_sorted, y_ends_sorted)]
-
-    return SampleYProfile(
-        bin_loci=bin_loci,
-        bin_starts=y_starts_sorted,
-        bin_ends=y_ends_sorted,
-        y_norm_bins=y_norm,
-    )
-
-
-def _pick_col(
-    col_map: dict[str, str], candidates: tuple[str, ...], fallback: str
-) -> str:
-    return next((col_map[k] for k in candidates if k in col_map), fallback)
-
-
-def _read_binned_counts_bed(bed_path: Path) -> SampleYProfile:
-    """Parse a headered or headerless 4-column binned read count BED/TSV file."""
-    first_data_line = ""
-    skip_lines = 0
-    with open_text_file(bed_path) as fh:
-        for line in fh:
-            stripped = line.strip()
-            if not stripped:
-                skip_lines += 1
-                continue
-            if stripped.startswith("#"):
-                clean = stripped.lstrip("#").strip().lower()
-                if clean.startswith(("chr", "chrom", "chromosome")):
-                    first_data_line = stripped
-                    break
-                skip_lines += 1
-                continue
-            first_data_line = stripped
-            break
-
-    if not first_data_line:
-        raise ValueError(f"Binned read count file '{bed_path}' is empty.")
-
-    parts = first_data_line.split("\t")
-    if len(parts) < 4:
-        parts = first_data_line.split()
-    if len(parts) < 4:
-        raise ValueError(
-            f"File '{bed_path}' must have at least 4 tab-separated columns (chr, start, end, count)."
-        )
-
-    try:
-        int(parts[1])
-        int(parts[2])
-        has_header = False
-    except ValueError:
-        has_header = True
-
-    df = pl.read_csv(
-        bed_path,
-        separator="\t",
-        skip_lines=skip_lines,
-        has_header=has_header,
-        null_values=NA_VALUES,
-        infer_schema_length=1000,
-    )
-    if has_header:
-        col_map = {c.strip().lstrip("#").lower(): c for c in df.columns}
-        cols = [
-            _pick_col(col_map, ("chr", "chrom", "chromosome"), df.columns[0]),
-            _pick_col(col_map, ("start", "chromstart"), df.columns[1]),
-            _pick_col(col_map, ("end", "chromend"), df.columns[2]),
-            _pick_col(
-                col_map,
-                (
-                    "count",
-                    "counts",
-                    "reads",
-                    "read_count",
-                    "depth",
-                    "coverage",
-                    "ratio",
-                ),
-                df.columns[3],
-            ),
-        ]
-    else:
-        cols = df.columns[:4]
-
-    df = df.select(
-        pl.col(cols[0]).cast(pl.String).alias("chr"),
-        pl.col(cols[1]).cast(pl.Int64).alias("start"),
-        pl.col(cols[2]).cast(pl.Int64).alias("end"),
-        pl.col(cols[3]).cast(pl.Float64).alias("count"),
-    ).with_columns(pl.Series("chr", [_normalize_chr(c) for c in df[cols[0]].to_list()]))
-
-    auto_df = df.filter(pl.col("chr").is_in(list(AUTOSOME_CHRS)))
-    y_df = df.filter(pl.col("chr") == "Y")
-
-    return _compute_y_profile_from_bins(
-        auto_starts=auto_df["start"].to_numpy(),
-        auto_ends=auto_df["end"].to_numpy(),
-        auto_counts=auto_df["count"].to_numpy(),
-        y_starts=y_df["start"].to_numpy(),
-        y_ends=y_df["end"].to_numpy(),
-        y_counts=y_df["count"].to_numpy(),
-    )
-
-
-def _iter_bgzf_blocks(fh: BinaryIO) -> bytes:
-    """Decompress all BGZF/gzip blocks from a BAM file stream."""
-    chunks: list[bytes] = []
-    while True:
-        header = fh.read(12)
-        if not header:
-            break
-        if len(header) < 12:
-            raise ValueError("Truncated BGZF block header in BAM file.")
-        id1, id2, cm, flg, _mtime, _xfl, _os, xlen = struct.unpack("<BBBBIBBH", header)
-        if id1 != 0x1F or id2 != 0x8B or cm != 8:
-            raise ValueError("Invalid gzip/BGZF magic bytes in BAM file.")
-        extra = fh.read(xlen) if (flg & 0x04) else b""
-        bsize: int | None = None
-        idx = 0
-        while idx + 4 <= len(extra):
-            si1, si2, slen = struct.unpack_from("<BBH", extra, idx)
-            idx += 4
-            if si1 == 66 and si2 == 67 and slen == 2 and idx + 2 <= len(extra):
-                bsize = struct.unpack_from("<H", extra, idx)[0]
-            idx += slen
-
-        if bsize is None:
-            raise ValueError("BAM file is missing BGZF BC subfield.")
-        cdata_len = (bsize + 1) - 12 - xlen - 8
-        if cdata_len < 0:
-            raise ValueError("Corrupt BGZF block size in BAM file.")
-        cdata = fh.read(cdata_len)
-        trailer = fh.read(8)
-        if len(cdata) < cdata_len or len(trailer) < 8:
-            raise ValueError("Truncated BGZF block payload in BAM file.")
-        _crc, isize = struct.unpack("<II", trailer)
-        if isize > 0:
-            chunks.append(zlib.decompress(cdata, -zlib.MAX_WBITS))
-    return b"".join(chunks)
-
-
-def _init_ref_bins(
-    refs: list[tuple[str, int]], binsize: int
-) -> tuple[dict[int, str], dict[str, int], dict[str, np.ndarray]]:
-    idx_to_chr: dict[int, str] = {}
-    ref_lengths: dict[str, int] = {}
-    bin_counts: dict[str, np.ndarray] = {}
-    for idx, (raw_name, length) in enumerate(refs):
-        norm_chr = _normalize_chr(raw_name)
-        if (norm_chr in AUTOSOME_CHRS or norm_chr == "Y") and length > 0:
-            idx_to_chr[idx] = norm_chr
-            ref_lengths[norm_chr] = length
-            bin_counts[norm_chr] = np.zeros(
-                (length + binsize - 1) // binsize, dtype=np.int64
-            )
-    return idx_to_chr, ref_lengths, bin_counts
-
-
-def _record_hit(
-    bin_counts: dict[str, np.ndarray],
-    chrom: str | None,
-    pos0: int,
-    binsize: int,
-) -> None:
-    if chrom is not None and pos0 >= 0:
-        arr = bin_counts[chrom]
-        bin_idx = pos0 // binsize
-        if bin_idx < arr.size:
-            arr[bin_idx] += 1
-
-
-def _finalize_bam_bin_counts(
-    ref_lengths: dict[str, int],
-    bin_counts: dict[str, np.ndarray],
-    binsize: int,
-) -> SampleYProfile:
-    """Convert per-chromosome bin count arrays from aligned reads into a SampleYProfile."""
-    if "Y" not in ref_lengths or "Y" not in bin_counts:
-        raise ValueError(
-            "Alignment header does not contain chromosome Y ('Y' or 'chrY')."
-        )
-
-    auto_starts_list: list[np.ndarray] = []
-    auto_ends_list: list[np.ndarray] = []
-    auto_counts_list: list[np.ndarray] = []
-
-    for chrom in sorted(AUTOSOME_CHRS):
-        if chrom not in ref_lengths:
-            continue
-        rlen = ref_lengths[chrom]
-        starts = np.arange(0, rlen, binsize, dtype=np.int64)
-        auto_starts_list.append(starts + 1)
-        auto_ends_list.append(np.minimum(starts + binsize, rlen))
-        auto_counts_list.append(bin_counts[chrom].astype(np.float64))
-
-    if not auto_counts_list:
-        raise ValueError(
-            "Alignment file contains no reference autosomes for normalization."
-        )
-
-    y_len = ref_lengths["Y"]
-    y_starts = np.arange(0, y_len, binsize, dtype=np.int64)
-    return _compute_y_profile_from_bins(
-        auto_starts=np.concatenate(auto_starts_list),
-        auto_ends=np.concatenate(auto_ends_list),
-        auto_counts=np.concatenate(auto_counts_list),
-        y_starts=y_starts + 1,
-        y_ends=np.minimum(y_starts + binsize, y_len),
-        y_counts=bin_counts["Y"].astype(np.float64),
-    )
-
-
-def _read_bam_native(bam_path: Path, binsize: int, mapq: int) -> SampleYProfile:
-    """Read and bin a BAM file using Python's built-in zlib and struct modules."""
-    with bam_path.open("rb") as fh:
-        raw = _iter_bgzf_blocks(fh)
-
-    if len(raw) < 12 or raw[:4] != b"BAM\x01":
-        raise ValueError(f"File '{bam_path}' is not a valid BAM file.")
-
-    l_text = struct.unpack_from("<i", raw, 4)[0]
-    offset = 8 + l_text
-    n_ref = struct.unpack_from("<i", raw, offset)[0]
-    offset += 4
-
-    refs: list[tuple[str, int]] = []
-    for _ in range(n_ref):
-        l_name = struct.unpack_from("<i", raw, offset)[0]
-        offset += 4
-        name = raw[offset : offset + l_name].rstrip(b"\x00").decode("ascii")
-        offset += l_name
-        l_ref = struct.unpack_from("<i", raw, offset)[0]
-        offset += 4
-        refs.append((name, l_ref))
-
-    ref_id_to_chr, ref_lengths, bin_counts = _init_ref_bins(refs, binsize)
-    total_len = len(raw)
-    while offset + 4 <= total_len:
-        block_size = struct.unpack_from("<i", raw, offset)[0]
-        rec_start = offset + 4
-        offset = rec_start + block_size
-        if offset > total_len or block_size < 16:
-            break
-        ref_id, pos0, _lq, rec_mapq, _bin, _nc, flag = struct.unpack_from(
-            "<iiBBHHH", raw, rec_start
-        )
-        if (flag & SKIP_BAM_FLAGS) == 0 and rec_mapq >= mapq:
-            _record_hit(bin_counts, ref_id_to_chr.get(ref_id), pos0, binsize)
-
-    return _finalize_bam_bin_counts(ref_lengths, bin_counts, binsize)
-
-
-def _read_alignment_external(
-    aln_path: Path, binsize: int, mapq: int, reference: Path | None
-) -> SampleYProfile:
-    """Read BAM/CRAM/SAM via pysam when available, falling back to samtools CLI."""
-    if importlib.util.find_spec("pysam") is not None:
-        import pysam
-
-        ref_arg = str(reference) if reference is not None else None
-        with pysam.AlignmentFile(str(aln_path), reference_filename=ref_arg) as samfile:
-            refs = [
-                (samfile.get_reference_name(i), int(samfile.lengths[i]))
-                for i in range(samfile.nreferences)
-            ]
-            tid_to_chr, ref_lengths, bin_counts = _init_ref_bins(refs, binsize)
-            for read in samfile.fetch(until_eof=True):
-                if (read.flag & SKIP_BAM_FLAGS) == 0 and read.mapping_quality >= mapq:
-                    _record_hit(
-                        bin_counts,
-                        tid_to_chr.get(read.reference_id),
-                        read.reference_start,
-                        binsize,
-                    )
-        return _finalize_bam_bin_counts(ref_lengths, bin_counts, binsize)
-
-    samtools_bin = shutil.which("samtools")
-    if samtools_bin is None:
-        raise RuntimeError(
-            f"Cannot read '{aln_path}': install 'pysam' or 'samtools', or provide a '.bam' or binned '.bed' file."
-        )
-    ref_flags = ["-T", str(reference)] if reference is not None else []
-    hdr_out = subprocess.run(
-        [samtools_bin, "view", "-H", *ref_flags, str(aln_path)],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    refs_sam: list[tuple[str, int]] = []
-    for line in hdr_out.splitlines():
-        if line.startswith("@SQ"):
-            fields = {
-                f[:2]: f[3:] for f in line.split("\t")[1:] if f[:3] in {"SN:", "LN:"}
-            }
-            if "SN" in fields and "LN" in fields:
-                refs_sam.append((fields["SN"], int(fields["LN"])))
-
-    idx_to_chr, ref_lengths, bin_counts = _init_ref_bins(refs_sam, binsize)
-    raw_to_chr = {
-        name: idx_to_chr[i] for i, (name, _) in enumerate(refs_sam) if i in idx_to_chr
-    }
-    view_cmd = [
-        samtools_bin,
-        "view",
-        "-F",
-        str(SKIP_BAM_FLAGS),
-        "-q",
-        str(mapq),
-        *ref_flags,
-        str(aln_path),
-    ]
-    with subprocess.Popen(view_cmd, stdout=subprocess.PIPE, text=True) as proc:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            parts = line.split("\t", 5)
-            if len(parts) >= 4:
-                _record_hit(
-                    bin_counts, raw_to_chr.get(parts[2]), int(parts[3]) - 1, binsize
-                )
-        if proc.wait() != 0:
-            raise RuntimeError(f"samtools view failed on '{aln_path}'.")
-
-    return _finalize_bam_bin_counts(ref_lengths, bin_counts, binsize)
-
-
 def extract_sample_y_profile(
     input_path: Path,
     binsize: int = 5000,
     mapq: int = 1,
     reference: Path | None = None,
+    index: Path | None = None,
 ) -> SampleYProfile:
-    """Extract diploid-normalized chromosome Y bin profile from an alignment or binned BED file."""
-    if not input_path.is_file():
-        raise FileNotFoundError(f"The file '{input_path}' does not exist.")
-    if binsize <= 0:
-        raise ValueError("--binsize must be a positive integer.")
+    """Extract diploid-normalized chromosome Y bin profile from an alignment file."""
+    ref_lengths, bin_counts = read_alignment_bins(
+        input_path,
+        binsize=binsize,
+        mapq=mapq,
+        reference=reference,
+        target_chrs=FFY_TARGET_CHRS,
+        index=index,
+    )
+    if "Y" not in ref_lengths or "Y" not in bin_counts:
+        raise ValueError(
+            "Alignment header does not contain chromosome Y ('Y' or 'chrY')."
+        )
 
-    suffix = input_path.suffix.lower()
-    if suffix in ALIGNMENT_SUFFIXES:
-        if suffix == ".bam" and importlib.util.find_spec("pysam") is None:
-            profile = _read_bam_native(input_path, binsize=binsize, mapq=mapq)
-        else:
-            profile = _read_alignment_external(
-                input_path, binsize=binsize, mapq=mapq, reference=reference
-            )
-    else:
-        profile = _read_binned_counts_bed(input_path)
+    r_auto = compute_autosomal_density(ref_lengths, bin_counts, binsize)
+
+    y_len = ref_lengths["Y"]
+    y_starts0 = np.arange(0, y_len, binsize, dtype=np.int64)
+    y_starts = y_starts0 + 1
+    y_ends = np.minimum(y_starts0 + binsize, y_len)
+    y_widths = np.maximum(1, y_ends - y_starts0).astype(np.float64)
+    y_counts = bin_counts["Y"].astype(np.float64)
+
+    y_norm = np.where(
+        np.isfinite(y_counts),
+        y_counts / (r_auto * y_widths),
+        np.nan,
+    )
+    bin_loci = [f"Y:{int(s)}-{int(e)}" for s, e in zip(y_starts, y_ends)]
 
     logger.debug(
         "Extracted chrY profile from '%s': %d chrY bins",
         input_path,
-        len(profile.bin_loci),
+        len(bin_loci),
     )
-    return profile
+    return SampleYProfile(
+        bin_loci=bin_loci,
+        bin_starts=y_starts,
+        bin_ends=y_ends,
+        y_norm_bins=y_norm,
+    )
 
 
 def _align_profile_to_loci(
@@ -469,11 +108,11 @@ def _align_profile_to_loci(
 
 
 def _extract_profile_worker(
-    args: tuple[Path, int, int, Path | None],
+    args: tuple[Path, int, int, Path | None, Path | None],
 ) -> SampleYProfile:
-    path, binsize, mapq, reference = args
+    path, binsize, mapq, reference, index = args
     return extract_sample_y_profile(
-        path, binsize=binsize, mapq=mapq, reference=reference
+        path, binsize=binsize, mapq=mapq, reference=reference, index=index
     )
 
 
@@ -487,7 +126,7 @@ def run_ffy_single(
     json_arg: str | None = None,
     device_name: str = "auto",
 ) -> tuple[str, float]:
-    """Calculate gender and baseline FFY (%) for a single BAM/CRAM/BED sample."""
+    """Calculate sex and baseline FFY (0-1 fraction) for a single BAM/CRAM/SAM sample."""
     from preface.models import load_ffy_onnx_metadata, run_ffy_onnx_inference
 
     if model_path is not None:
@@ -505,10 +144,10 @@ def run_ffy_single(
             else float(np.mean(aligned_y))
         )
         thresh = yfrac if yfrac is not None else meta.yfrac_threshold
-        gender = "M" if y_score >= thresh else "F"
-        ffy_pct = (
+        sex = "M" if y_score >= thresh else "F"
+        ffy = (
             run_ffy_onnx_inference(model_path, aligned_y, device_name)
-            if gender == "M"
+            if sex == "M"
             else 0.0
         )
     else:
@@ -522,25 +161,20 @@ def run_ffy_single(
             raise ValueError(f"Sample '{infile}' has no finite chromosome Y bins.")
         y_score = float(np.mean(finite_vals))
         thresh = yfrac if yfrac is not None else 0.01
-        gender = "M" if y_score >= thresh else "F"
-        ffy_pct = (
-            float(np.clip(2.0 * y_score * 100.0, 0.0, 100.0)) if gender == "M" else 0.0
-        )
+        sex = "M" if y_score >= thresh else "F"
+        ffy = float(np.clip(2.0 * y_score, 0.0, 1.0)) if sex == "M" else 0.0
 
-    logger.debug(
-        "Single-sample FFY for '%s': gender=%s, FFY=%.4f%%", infile, gender, ffy_pct
-    )
+    logger.debug("Single-sample FFY for '%s': sex=%s, FFY=%.6f", infile, sex, ffy)
     emit_prediction_output(
-        [f"gender = {gender}", f"FFY = {ffy_pct:.4g}%"],
-        {"FFY": ffy_pct / 100.0, "gender": gender},
+        [f"sex = {sex}", f"FFY = {ffy:.4g}"],
+        {"FFY": ffy, "sex": sex},
         json_arg,
     )
-    return gender, ffy_pct
+    return sex, ffy
 
 
-def run_ffy_cohort(
-    config_path: Path,
-    outfile: Path | None = None,
+def estimate_cohort_ffy(
+    entries: Sequence[SampleEntry],
     male_ref_paths: list[Path] | None = None,
     save_model_path: Path | None = None,
     binsize: int = 5000,
@@ -550,49 +184,33 @@ def run_ffy_cohort(
     reference: Path | None = None,
     cpus: int = 1,
     seed: int = 1,
-) -> pl.DataFrame:
-    """Calculate baseline FFY and gender across a cohort per PMC6771918 Section 3.4."""
-    from preface.hardware import configure_hardware
+) -> list[SampleEntry]:
+    """Estimate baseline FFY (0-1 fraction) and sex across a cohort of SampleEntry objects."""
     from preface.math_utils import fit_lasso_fista, infer_sex_gmm_1d
     from preface.models import export_ffy_model_to_onnx
 
-    if not config_path.is_file():
-        raise FileNotFoundError(f"The file '{config_path}' does not exist.")
+    entry_list = list(entries)
+    n_samples = len(entry_list)
+    if n_samples == 0:
+        raise ValueError("Samplesheet contains no samples.")
 
-    resolved_cpus = configure_hardware(cpus=cpus, seed=seed)
     rng = np.random.default_rng(seed)
 
-    df = pl.read_csv(
-        config_path, separator="\t", null_values=NA_VALUES, infer_schema_length=1000
-    )
-    if "ID" not in df.columns or (
-        "filepath" not in df.columns and "reads_filepath" not in df.columns
-    ):
-        raise ValueError(
-            f"Cohort file '{config_path}' is missing required column 'ID' or 'filepath/reads_filepath'."
-        )
-
-    n_samples = df.height
-    if n_samples == 0:
-        raise ValueError(f"Cohort file '{config_path}' contains no samples.")
-
-    reads_col = "reads_filepath" if "reads_filepath" in df.columns else "filepath"
-    sample_ids = [str(s) for s in df["ID"].to_list()]
-    input_paths = [Path(str(p)) for p in df[reads_col].to_list()]
-
-    combined_items = [
-        (sid, (path, binsize, mapq, reference))
-        for sid, path in zip(sample_ids, input_paths)
+    combined_items: list[
+        tuple[str, tuple[Path, int, int, Path | None, Path | None]]
+    ] = [
+        (entry.id, (entry.filepath, binsize, mapq, reference, entry.index))
+        for entry in entry_list
     ]
     if male_ref_paths:
         combined_items.extend(
-            (f"male_ref:{p.name}", (p, binsize, mapq, reference))
+            (f"male_ref:{p.name}", (p, binsize, mapq, reference, None))
             for p in male_ref_paths
         )
 
     logger.info("Extracting chrY profiles for %d cohort samples ...", n_samples)
     all_profiles = parallel_load_samples(
-        combined_items, _extract_profile_worker, cpus=resolved_cpus
+        combined_items, _extract_profile_worker, cpus=cpus
     )
     cohort_profiles = all_profiles[:n_samples]
     lb_profiles = all_profiles[n_samples:]
@@ -613,17 +231,14 @@ def run_ffy_cohort(
     raw_scores = np.mean(y_matrix[:, init_info_mask], axis=1)
 
     inferred_all, learned_thresh = infer_sex_gmm_1d(raw_scores, yfrac=yfrac)
-    if "gender" in df.columns:
-        genders = [
-            str(g).strip().upper()
-            if g is not None and str(g).strip().upper() in {"M", "F"}
-            else inf
-            for g, inf in zip(df["gender"].to_list(), inferred_all)
-        ]
-    else:
-        genders = inferred_all
+    sexes = [
+        entry.sex.strip().upper()
+        if entry.sex is not None and entry.sex.strip().upper() in {"M", "F"}
+        else inf
+        for entry, inf in zip(entry_list, inferred_all)
+    ]
 
-    male_mask = np.array([g == "M" for g in genders], dtype=bool)
+    male_mask = np.array([s == "M" for s in sexes], dtype=bool)
     female_mask = ~male_mask
     n_males = int(np.sum(male_mask))
     n_females = int(np.sum(female_mask))
@@ -680,7 +295,7 @@ def run_ffy_cohort(
     denom = max(male_100_baseline - female_baseline, 1e-6)
     prior_ffy = np.zeros(n_samples, dtype=np.float64)
     prior_ffy[male_mask] = np.clip(
-        ((y_scores[male_mask] - female_baseline) / denom) * 100.0, 0.0, 100.0
+        (y_scores[male_mask] - female_baseline) / denom, 0.0, 1.0
     )
 
     x_lasso = np.zeros_like(y_matrix)
@@ -706,7 +321,7 @@ def run_ffy_cohort(
                 x_lasso[train_mask, :], prior_ffy[train_mask], lam=lasso_lambda
             )
             cv_preds[test_idx] = b0 + x_lasso[test_idx, :] @ w_fold
-        final_ffy = np.where(male_mask, np.clip(cv_preds, 0.0, 100.0), 0.0)
+        final_ffy = np.where(male_mask, np.clip(cv_preds, 0.0, 1.0), 0.0)
     else:
         logger.warning(
             "Fewer than 4 male/total samples (%d male, %d total); skipping CV Lasso and using prior FFY.",
@@ -729,22 +344,48 @@ def run_ffy_cohort(
             onnx_path=save_model_path,
         )
 
-    out_path_col = "filepath" if "filepath" in df.columns else reads_col
-    out_df = pl.DataFrame(
-        {
-            "ID": df["ID"].cast(pl.String),
-            "filepath": df[out_path_col].cast(pl.String),
-            "gender": genders,
-            "FF": final_ffy,
-        }
+    return [
+        SampleEntry(
+            id=entry.id,
+            filepath=entry.filepath,
+            index=entry.index,
+            sex=sex,
+            ff=float(entry.ff) if entry.ff is not None else float(ffy_val),
+        )
+        for entry, sex, ffy_val in zip(entry_list, sexes, final_ffy)
+    ]
+
+
+def run_ffy_cohort(
+    samplesheet_path: Path,
+    outfile: Path | None = None,
+    male_ref_paths: list[Path] | None = None,
+    save_model_path: Path | None = None,
+    binsize: int = 5000,
+    mapq: int = 1,
+    yfrac: float | None = None,
+    lasso_lambda: float = 1e-4,
+    reference: Path | None = None,
+    cpus: int = 1,
+    seed: int = 1,
+) -> list[SampleEntry]:
+    """Calculate baseline FFY and sex across a cohort samplesheet per PMC6771918 Section 3.4."""
+    from preface.hardware import configure_hardware
+
+    resolved_cpus = configure_hardware(cpus=cpus, seed=seed)
+    entries = load_samplesheet(samplesheet_path)
+    updated_entries = estimate_cohort_ffy(
+        entries=entries,
+        male_ref_paths=male_ref_paths,
+        save_model_path=save_model_path,
+        binsize=binsize,
+        mapq=mapq,
+        yfrac=yfrac,
+        lasso_lambda=lasso_lambda,
+        reference=reference,
+        cpus=resolved_cpus,
+        seed=seed,
     )
-
-    tsv_text = out_df.write_csv(separator="\t")
-    if outfile is not None:
-        outfile.parent.mkdir(parents=True, exist_ok=True)
-        outfile.write_text(tsv_text, encoding="utf-8")
-        logger.info("Wrote cohort FFY config (%d samples) to '%s'", n_samples, outfile)
-    else:
-        print(tsv_text, end="")
-
-    return out_df
+    default_fmt = "json" if samplesheet_path.suffix.lower() == ".json" else "yaml"
+    write_samplesheet(updated_entries, outfile=outfile, default_format=default_fmt)
+    return updated_entries

@@ -102,7 +102,7 @@ def plot_performance(
     ax_pca.set_yticklabels([f"{y_min:.3g}", f"{y_max:.3g}"], fontsize=7)
 
     ax_scat = axes[1]
-    mx = float(max(np.max(v1_arr, initial=1.0), np.max(v2_arr, initial=1.0)))
+    mx = float(max(np.max(v1_arr, initial=1e-3), np.max(v2_arr, initial=1e-3)))
     ax_scat.scatter(v1_arr, v2_arr, s=10, color="black", edgecolors="none")
 
     intercept, slope = ols_fit(v1_arr, v2_arr)
@@ -211,7 +211,7 @@ def plot_ffx(
     ax_left.plot([], [], color=COLOR_B, linewidth=2.0, linestyle=":", label="f(x)=x")
     ax_left.plot([], [], color="none", label=f"(wr = {_signif(weighted_r, 4)})")
     ax_left.set_xlim(0.0, max_v1)
-    _style_axis(ax_left, "FF (%)", "μ(ratio X)")
+    _style_axis(ax_left, "FF", "μ(ratio X)")
     ax_left.legend(loc="upper right", frameon=False, fontsize=6.5)
 
     ax_right = axes[1]
@@ -229,7 +229,7 @@ def plot_ffx(
         linestyle=":",
     )
     ax_right.set_xlim(0.0, max_v1)
-    _style_axis(ax_right, "FF (%)", "FFX (%)")
+    _style_axis(ax_right, "FF", "FFX")
 
     fig.savefig(path, dpi=1024)
     plt.close(fig)

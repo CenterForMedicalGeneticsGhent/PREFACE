@@ -9,11 +9,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from preface.ffy import estimate_cohort_ffy
 from preface.hardware import configure_hardware, resolve_device
 from preface.io import (
     emit_prediction_output,
-    load_config,
-    load_inference_bed,
+    load_inference_alignment,
+    load_samplesheet,
     load_training_dataset,
 )
 from preface.logging_utils import get_logger
@@ -95,8 +96,8 @@ def _run_cross_validation(
             y_test,
             pca_fold.importance_prop,
             n_feat,
-            "PREFACE (%)",
-            "FF (%)",
+            "PREFACE",
+            "FF",
             repeats_dir / f"repeat_{rep}.png",
         )
         fold_predictions.append(pred_fold)
@@ -115,8 +116,8 @@ def _write_training_statistics(
     the_slope: float,
     elapsed_seconds: int,
 ) -> None:
-    """Format and write training_statistics.txt matching PREFACE.R."""
-    index_10 = labeled_ff < (20.0 - predictions)
+    """Format and write training_statistics.txt."""
+    index_10 = labeled_ff < (0.20 - predictions)
     deviations_10 = np.abs(predictions[index_10] - labeled_ff[index_10])
     mae_10 = float(np.mean(deviations_10)) if deviations_10.size > 0 else float("nan")
     sd_10 = (
@@ -132,11 +133,11 @@ def _write_training_statistics(
         lines.extend(
             [
                 "Below, some of the top candidates for outlier removal are listed.",
-                "If you know some of these are low quality/have sex aberrations (when using FFY as response variable), remove them from the config file and re-run.",
+                "If you know some of these are low quality/have sex aberrations (when using FFY as response variable), remove them from the samplesheet and re-run.",
                 "Avoid removing other cases, as this will result in inaccurate performance statistics and possible overfitting towards irrelevant models.",
                 "",
                 "_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_",
-                "ID\tFF (%) - PREFACE (%)",
+                "ID\tFF - PREFACE",
             ]
         )
         outlier_abs_vals = deviations[outlier_indices]
@@ -151,7 +152,7 @@ def _write_training_statistics(
             f"Training time: {elapsed_seconds} seconds",
             f"Overall correlation (r): {_format_stat(metrics.cor)}",
             f"Overall mean absolute error (MAE): {_format_stat(metrics.mae)} ± {_format_stat(metrics.sd_diff)}",
-            f"FF < 10% mean absolute error (MAE): {_format_stat(mae_10)} ± {_format_stat(sd_10)}",
+            f"FF < 0.1 mean absolute error (MAE): {_format_stat(mae_10)} ± {_format_stat(sd_10)}",
             "Correction for skew: ",
             f"\tIntercept: {_format_stat(the_intercept)}",
             f"\tSlope: {_format_stat(the_slope)}",
@@ -167,7 +168,7 @@ def _write_training_statistics(
 
 
 def run_train(
-    config_path: Path,
+    samplesheet_path: Path,
     outdir: Path,
     n_feat: int = 50,
     hidden: int = 2,
@@ -175,6 +176,11 @@ def run_train(
     femprop: bool = False,
     olm: bool = False,
     noskewcorrect: bool = False,
+    binsize: int = 100_000,
+    ffy_binsize: int = 5_000,
+    mapq: int = 1,
+    reference: Path | None = None,
+    male_ref_paths: list[Path] | None = None,
     device_name: str = "auto",
     seed: int = 1,
 ) -> Path:
@@ -183,8 +189,7 @@ def run_train(
 
     start_time = time.perf_counter()
 
-    if not config_path.is_file():
-        raise FileNotFoundError(f"The file '{config_path}' does not exist.")
+    raw_entries = load_samplesheet(samplesheet_path)
 
     outdir.mkdir(parents=True, exist_ok=True)
     if not outdir.is_dir():
@@ -194,19 +199,50 @@ def run_train(
     device = resolve_device(device_name)
     rng = np.random.default_rng(seed)
 
-    train_genders = {"M", "F"} if femprop else {"M"}
-    config_df = load_config(config_path, rng=rng)
-    genders = config_df["gender"].to_list()
-    labeled_mask = np.array([g in train_genders for g in genders], dtype=bool)
+    train_sexes = {"M", "F"} if femprop else {"M"}
+    needs_ffy = any(
+        e.sex is None or (e.sex in train_sexes and e.ff is None) for e in raw_entries
+    )
+    if needs_ffy:
+        logger.info(
+            "Samplesheet has missing sex or ff values; estimating cohort FFY ..."
+        )
+        raw_entries = estimate_cohort_ffy(
+            entries=raw_entries,
+            male_ref_paths=male_ref_paths,
+            binsize=ffy_binsize,
+            mapq=mapq,
+            reference=reference,
+            cpus=resolved_cpus,
+            seed=seed,
+        )
+
+    perm = rng.permutation(len(raw_entries))
+    entries = [raw_entries[int(i)] for i in perm]
+
+    sexes = [e.sex for e in entries]
+    ff_all = np.array(
+        [float(e.ff) if e.ff is not None else np.nan for e in entries],
+        dtype=np.float64,
+    )
+    labeled_mask = np.array(
+        [s in train_sexes and np.isfinite(f) for s, f in zip(sexes, ff_all)],
+        dtype=bool,
+    )
     n_labeled = int(np.sum(labeled_mask))
 
     if n_labeled < n_feat:
         raise ValueError(f"Please provide at least {n_feat} labeled samples.")
 
-    dataset = load_training_dataset(config_df=config_df, cpus=resolved_cpus)
+    dataset = load_training_dataset(
+        entries=entries,
+        binsize=binsize,
+        mapq=mapq,
+        reference=reference,
+        cpus=resolved_cpus,
+    )
     training_frame = dataset.training_frame
-    ff_all = config_df["FF"].to_numpy().astype(np.float64, copy=False)
-    ids_all = config_df["ID"].to_list()
+    ids_all = [e.id for e in entries]
 
     repeats_dir = outdir / "training_repeats"
     repeats_dir.mkdir(parents=True, exist_ok=True)
@@ -243,7 +279,9 @@ def run_train(
     else:
         the_intercept, the_slope = 0.0, 1.0
 
-    male_mask = np.array([g == "M" for g in genders], dtype=bool)
+    male_mask = np.array(
+        [s == "M" and np.isfinite(f) for s, f in zip(sexes, ff_all)], dtype=bool
+    )
     v1_male_ff = ff_all[male_mask]
     v2_male_x = dataset.x_ratios[male_mask]
     the_intercept_x, the_slope_x, wr = rlm_huber(v1_male_ff, v2_male_x)
@@ -272,8 +310,8 @@ def run_train(
         labeled_ff,
         pca_final.importance_prop,
         n_feat,
-        "PREFACE (%)",
-        "FF (%)",
+        "PREFACE",
+        "FF",
         outdir / "overall_performance.png",
     )
 
@@ -302,6 +340,7 @@ def run_train(
         the_slope_x=the_slope_x,
         possible_features=dataset.possible_features,
         onnx_path=onnx_path,
+        binsize=binsize,
     )
 
     logger.info(
@@ -314,10 +353,12 @@ def run_train(
 def run_predict(
     infile: Path,
     model_path: Path,
+    mapq: int = 1,
+    reference: Path | None = None,
     json_arg: str | None = None,
     device_name: str = "auto",
 ) -> tuple[float, float]:
-    """Run PREFACE prediction on a single sample BED file using a trained ONNX model."""
+    """Run PREFACE prediction on a single sample alignment file using a trained ONNX model."""
     if not infile.is_file():
         raise FileNotFoundError(f"The file '{infile}' does not exist.")
     if not model_path.is_file():
@@ -325,7 +366,13 @@ def run_predict(
 
     logger.debug("Loading PREFACE ONNX model from '%s'", model_path)
     meta = load_onnx_metadata(model_path)
-    sample_data = load_inference_bed(infile, meta.possible_features)
+    sample_data = load_inference_alignment(
+        infile,
+        meta.possible_features,
+        binsize=meta.binsize,
+        mapq=mapq,
+        reference=reference,
+    )
 
     ffx = (sample_data.x_ratio - meta.the_intercept_x) / meta.the_slope_x
     prediction = run_onnx_inference(
@@ -333,13 +380,11 @@ def run_predict(
         feature_ratios=sample_data.feature_ratios,
         requested_device=device_name,
     )
-    logger.debug(
-        "Predicted FFX=%.4f%%, PREFACE=%.4f%% for '%s'", ffx, prediction, infile
-    )
+    logger.debug("Predicted FFX=%.6f, PREFACE=%.6f for '%s'", ffx, prediction, infile)
 
     emit_prediction_output(
-        [f"FFX = {ffx:.4g}%", f"PREFACE = {prediction:.4g}%"],
-        {"FFX": ffx / 100.0, "PREFACE": prediction / 100.0},
+        [f"FFX = {ffx:.4g}", f"PREFACE = {prediction:.4g}"],
+        {"FFX": ffx, "PREFACE": prediction},
         json_arg,
     )
     return ffx, prediction

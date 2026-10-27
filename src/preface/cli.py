@@ -63,12 +63,40 @@ def common_options(
     configure_logging(loglevel)
 
 
+@app.command("lint")
+def lint_cmd(
+    samplesheet: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to YAML or JSON samplesheet file to validate against the JSON Schema.",
+        ),
+    ],
+    loglevel: LogLevelOption = None,
+) -> None:
+    """Validate a YAML or JSON samplesheet against the PREFACE JSON Schema."""
+    from preface.io import load_samplesheet
+
+    if loglevel is not None:
+        configure_logging(loglevel)
+
+    try:
+        entries = load_samplesheet(samplesheet)
+        logger.info(
+            "Samplesheet '%s' is valid (%d samples).", samplesheet, len(entries)
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        logger.error("%s", exc)
+        raise typer.Exit(code=1) from exc
+
+
 @app.command("train")
 def train_cmd(
-    config: Annotated[
+    samplesheet: Annotated[
         Path,
         typer.Option(
-            "--config", help="Path to tab-separated training config.txt file."
+            "-s",
+            "--samplesheet",
+            help="Path to training samplesheet (.yaml, .yml, or .json).",
         ),
     ],
     outdir: Annotated[
@@ -95,7 +123,7 @@ def train_cmd(
         bool,
         typer.Option(
             "--femprop",
-            help="Include female fetuses in supervised learning phase (requires proportional FF labels).",
+            help="Include female fetuses in supervised learning phase (requires proportional ff labels).",
         ),
     ] = False,
     olm: Annotated[
@@ -111,6 +139,41 @@ def train_cmd(
             help="Disable linear skew correction on cross-validated predictions.",
         ),
     ] = False,
+    binsize: Annotated[
+        int,
+        typer.Option(
+            "--binsize",
+            help="Genomic bin width in base pairs for autosomal/chrX feature extraction.",
+        ),
+    ] = 100_000,
+    ffy_binsize: Annotated[
+        int,
+        typer.Option(
+            "--ffy-binsize",
+            help="Genomic bin width in base pairs on chrY when auto-estimating FFY.",
+        ),
+    ] = 5_000,
+    mapq: Annotated[
+        int,
+        typer.Option(
+            "--mapq",
+            help="Minimum mapping quality for aligned BAM/CRAM/SAM reads.",
+        ),
+    ] = 1,
+    reference: Annotated[
+        Path | None,
+        typer.Option(
+            "--reference",
+            help="Reference FASTA file path for CRAM alignment decoding.",
+        ),
+    ] = None,
+    male_ref: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--male-ref",
+            help="Paths to 100% male reference BAM/CRAM/SAM samples when auto-estimating FFY.",
+        ),
+    ] = None,
     device: Annotated[
         str,
         typer.Option("--device", help="Compute device to use (auto, cpu, cuda, mps)."),
@@ -121,7 +184,7 @@ def train_cmd(
     ] = 1,
     loglevel: LogLevelOption = None,
 ) -> None:
-    """Train a PREFACE model and export it to ONNX."""
+    """Train a PREFACE model from aligned reads and export it to ONNX."""
     from preface.pipeline import run_train
 
     if loglevel is not None:
@@ -129,7 +192,7 @@ def train_cmd(
 
     try:
         run_train(
-            config_path=config,
+            samplesheet_path=samplesheet,
             outdir=outdir,
             n_feat=nfeat,
             hidden=hidden,
@@ -137,6 +200,11 @@ def train_cmd(
             femprop=femprop,
             olm=olm,
             noskewcorrect=noskewcorrect,
+            binsize=binsize,
+            ffy_binsize=ffy_binsize,
+            mapq=mapq,
+            reference=reference,
+            male_ref_paths=male_ref,
             device_name=device,
             seed=seed,
         )
@@ -150,13 +218,27 @@ def predict_cmd(
     infile: Annotated[
         Path,
         typer.Option(
-            "--infile", help="Path to sample copy number alteration .bed file."
+            "--infile", help="Path to sample aligned read file (.bam, .cram, .sam)."
         ),
     ],
     model: Annotated[
         Path,
         typer.Option("--model", help="Path to trained model.onnx file."),
     ],
+    mapq: Annotated[
+        int,
+        typer.Option(
+            "--mapq",
+            help="Minimum mapping quality for aligned BAM/CRAM/SAM reads.",
+        ),
+    ] = 1,
+    reference: Annotated[
+        Path | None,
+        typer.Option(
+            "--reference",
+            help="Reference FASTA file path for CRAM alignment decoding.",
+        ),
+    ] = None,
     json_out: Annotated[
         str | None,
         typer.Option(
@@ -172,7 +254,7 @@ def predict_cmd(
     ] = "auto",
     loglevel: LogLevelOption = None,
 ) -> None:
-    """Predict fetal fraction (FFX and PREFACE) for an input BED file using a trained ONNX model."""
+    """Predict fetal fraction (FFX and PREFACE) for an aligned read file using a trained ONNX model."""
     from preface.pipeline import run_predict
 
     if loglevel is not None:
@@ -182,6 +264,8 @@ def predict_cmd(
         run_predict(
             infile=infile,
             model_path=model,
+            mapq=mapq,
+            reference=reference,
             json_arg=json_out,
             device_name=device,
         )
@@ -192,25 +276,26 @@ def predict_cmd(
 
 @app.command("ffy")
 def ffy_cmd(
-    config: Annotated[
+    samplesheet: Annotated[
         Path | None,
         typer.Option(
-            "--config",
-            help="Path to cohort TSV file (ID, filepath, optional reads_filepath/gender).",
+            "-s",
+            "--samplesheet",
+            help="Path to cohort samplesheet (.yaml, .yml, or .json).",
         ),
     ] = None,
     infile: Annotated[
         Path | None,
         typer.Option(
             "--infile",
-            help="Path to single-sample BAM/CRAM or binned read count BED/TSV file.",
+            help="Path to single-sample BAM/CRAM/SAM alignment file.",
         ),
     ] = None,
     outfile: Annotated[
         Path | None,
         typer.Option(
             "--outfile",
-            help="Output path for generated cohort config.txt (defaults to stdout).",
+            help="Output path for generated samplesheet (.yaml, .yml, or .json; defaults to stdout).",
         ),
     ] = None,
     model: Annotated[
@@ -231,28 +316,28 @@ def ffy_cmd(
         list[Path] | None,
         typer.Option(
             "--male-ref",
-            help="Paths to 100% male reference BAM/CRAM/BED samples (LBs) per PMC6771918 Eq. 1.",
+            help="Paths to 100% male reference BAM/CRAM/SAM samples (LBs) per PMC6771918 Eq. 1.",
         ),
     ] = None,
     binsize: Annotated[
         int,
         typer.Option(
             "--binsize",
-            help="Bin width in base pairs when binning aligned BAM/CRAM reads.",
+            help="Bin width in base pairs when binning aligned BAM/CRAM/SAM reads.",
         ),
     ] = 5000,
     mapq: Annotated[
         int,
         typer.Option(
             "--mapq",
-            help="Minimum mapping quality for aligned BAM/CRAM reads.",
+            help="Minimum mapping quality for aligned BAM/CRAM/SAM reads.",
         ),
     ] = 1,
     yfrac: Annotated[
         float | None,
         typer.Option(
             "--yfrac",
-            help="Explicit normalized chrY read depth threshold for male/female classification.",
+            help="Explicit normalized chrY read depth threshold for male/female sex classification.",
         ),
     ] = None,
     lasso_lambda: Annotated[
@@ -293,20 +378,20 @@ def ffy_cmd(
     ] = 1,
     loglevel: LogLevelOption = None,
 ) -> None:
-    """Calculate baseline chromosome Y fetal fraction (FFY) from binned read counts or aligned reads."""
+    """Calculate baseline chromosome Y fetal fraction (FFY) and sex from aligned reads."""
     from preface.ffy import run_ffy_cohort, run_ffy_single
 
     if loglevel is not None:
         configure_logging(loglevel)
 
     try:
-        if (config is None) == (infile is None):
+        if (samplesheet is None) == (infile is None):
             raise ValueError(
-                "Provide exactly one of --config (cohort mode) or --infile (single-sample mode)."
+                "Provide exactly one of -s/--samplesheet (cohort mode) or --infile (single-sample mode)."
             )
-        if config is not None:
+        if samplesheet is not None:
             run_ffy_cohort(
-                config_path=config,
+                samplesheet_path=samplesheet,
                 outfile=outfile,
                 male_ref_paths=male_ref,
                 save_model_path=save_model,
@@ -335,7 +420,7 @@ def ffy_cmd(
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
-    """Support PREFACE.R's bare `--json` flag (without value) alongside `--json path/to/file.json`."""
+    """Support PREFACE's bare `--json` flag (without value) alongside `--json path/to/file.json`."""
     normalized: list[str] = []
     i = 0
     while i < len(argv):
@@ -350,7 +435,7 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 
 
 def main() -> None:
-    """CLI entrypoint normalizing legacy R-style optional flag arguments."""
+    """CLI entrypoint normalizing optional flag arguments."""
     sys.argv[1:] = _normalize_argv(sys.argv[1:])
     app()
 

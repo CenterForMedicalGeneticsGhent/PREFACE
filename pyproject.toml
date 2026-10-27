@@ -17,6 +17,9 @@ preface = "preface.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+preface = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
@@ -29,6 +32,7 @@ platforms = ["linux-64", "osx-arm64"]
 check = "ruff check --fix"
 format = "ruff format"
 preface = "preface"
+lint = "preface lint"
 ffy = "preface ffy"
 train = "preface train"
 predict = "preface predict"
@@ -44,8 +48,8 @@ onnx = ">=1.23"
 onnxscript = ">=0.7"
 onnxruntime = ">=1.31"
 typer = ">=0.15"
-polars = ">=2.0"
-polars-runtime-compat = ">=2.0"
+pyyaml = ">=6.0"
+jsonschema = ">=4.23"
 numpy = ">=2.5"
 scipy = ">=1.18"
 matplotlib-base = ">=3.11"

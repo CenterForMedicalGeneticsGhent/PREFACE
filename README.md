@@ -17,138 +17,132 @@ pixi run preface --version
 pixi run preface --help
 ```
 
-The original R script (`PREFACE.R`) remains in the repository for reference.
-
 # Manual
-
-## Installation
-
-Install the dependencies using `pixi`:
-
-```bash
-pixi install
-```
-
-and run the script using `pixi run`:
-
-```bash
-pixi run PREFACE.R <train/predict> ...
-```
 
 ## Required files
 
-### Copy number alteration .bed files
+### Aligned sequencing read files (`.bam`, `.cram`, `.sam`)
 
-Each sample (whether it is used for training or for predicting) should be passed to PREFACE in the format shown below. During benchmarking, using a bin size of 100 kb (others might work equally well), copy number normalization was performed by [WisecondorX](https://github.com/CenterForMedicalGeneticsGhent/WisecondorX/), yet PREFACE is not limited to any copy number alteration software, however, the default output of WisecondorX is directly interpretable by PREFACE.
+PREFACE operates directly on aligned sequencing read files for baseline `FFY` calculation, model training, and inference:
+- Primary, non-duplicate, non-QC-failed alignments with mapping quality at or above `--mapq` (default: `1`) are binned into fixed genomic windows of size `--binsize` (`5000` bp default for `preface ffy`; `100000` bp default for `preface train`).
+- `.bam` files are read via `pysam` when installed or Python's built-in BGZF/BAM parser. `.cram` files require `--reference` (FASTA) and either `pysam` or `samtools` in `PATH`.
+- Chromosome names may either omit or include the `chr` prefix (`1` until `22`, `X`, and `Y`, or `chr1` until `chr22`, `chrX`, and `chrY`). Chromosomes `13`, `18`, and `21` are excluded during diploid autosomal read-depth normalization and feature extraction.
 
-- Example: `./examples/infile.bed`
-- Tab-separated file with at least four columns.
-- The name of these columns (passed as a header) must be `chr`, `start`, `end` and `ratio`.
-    - The possible values of `chr` are `1` until `22`, and `X` and `Y` (uppercase).
-    - The `ratio` column contains the log2-transformed ratio between the observed and expected copy number.
-    - The ratio can be unknown at certain loci (e.g. often seen at centromeres). Here, values should be expressed as `NaN` or `NA`.
-- The order of rows does not matter. Yet, it is paramount that, for a certain line, file x deals with the same locus as file y. This implies, of course, that all copy number alteration files have the same number of lines.
+### Samplesheet (`.yaml`, `.yml`, or `.json`)
 
-### Binned read count or alignment files (for FFY calculation)
+Cohort commands (`preface ffy` and `preface train`) consume a unified YAML or JSON samplesheet containing a root-level array of sample objects:
 
-To calculate baseline chromosome Y fetal fraction (`FFY`) and infer fetal sex (`gender`) with `preface ffy`, each sample can be provided either as a binned read count file or as an aligned sequencing file:
+- Example: `./examples/samplesheet.yaml`
+- Every samplesheet is automatically validated against the bundled JSON Schema (`src/preface/samplesheet.schema.json`).
+- Each sample object supports the following properties (`additionalProperties: false`):
+    - `id` (required `string`): Unique identifier for the sample.
+    - `filepath` (required `string`): Path to the sample's aligned read file (`.bam`, `.cram`, or `.sam`). Must exist on disk and be readable.
+    - `index` (optional `string` or `null`): Path to the alignment index file (`.gzi`, `.bai`, `.csi`, or `.crai`). Must exist on disk and be readable when provided.
+    - `sex` (optional `"M"`, `"F"`, or `null`): Fetal sex (`M` for male, `F` for female). Automatically inferred by `preface ffy` (or `preface train`) when omitted or `null`.
+    - `ff` (optional `number` in `[0.0, 1.0]` or `null`): Fetal fraction expressed as a proportion between `0.0` and `1.0`. Automatically estimated by `preface ffy` (or `preface train`) when omitted or `null`.
 
-1. Binned read count `.bed` / `.tsv` files
-    - Example: `./examples/counts.bed`
-    - Tab-separated file with at least four columns representing chromosome, start coordinate, end coordinate, and read count.
-    - Both headered files and headerless 4-column BED files (such as outputs from `samtools bedcov`, `mosdepth`, or `bedtools multicov`) are accepted.
-        - When a header is present, `preface ffy` matches column names `chr` / `chrom` / `#chrom`, `start` / `chromStart`, `end` / `chromEnd`, and `count` / `counts` / `reads` / `read_count` / `depth` / `coverage` / `ratio` (falling back to the first four columns by position).
-        - Chromosome names may either omit or include the `chr` prefix (`1` until `22` and `Y`, or `chr1` until `chr22` and `chrY`).
-        - The count column must contain non-negative raw or depth-normalized read counts (not log2 copy number ratios, which contain negative values and typically mask chromosome `Y`).
-        - Each file must contain both autosomal bins (chromosomes `1` until `22`, where `13`, `18`, and `21` are automatically excluded during diploid read-depth normalization) and chromosome `Y` bins. A bin size of 5 kb on chromosome `Y` is recommended to match Section 3.4 of the PREFACE paper.
-2. Aligned read files (`.bam`, `.cram`, `.sam`)
-    - `preface ffy` bins primary, non-duplicate, non-QC-failed alignments with mapping quality at or above `--mapq` (default: `1`) into fixed genomic windows of size `--binsize` (default: `5000` bp) across autosomes and chromosome `Y`.
-    - `.bam` files are read directly using Python's built-in BGZF/BAM parser (or `pysam` when installed). `.cram` files require `--reference` (FASTA) and either `pysam` or `samtools` in `PATH`.
+Example YAML samplesheet:
 
-### PREFACE's config.txt
+```yaml
+- id: ID_0
+  filepath: /path/to/ID_0.bam
+  index: /path/to/ID_0.bam.bai
+  sex: M
+  ff: 0.10470662
+- id: ID_1
+  filepath: /path/to/ID_1.bam
+  sex: F
+  ff: 0.0
+```
 
-For training, PREFACE requires a config file.
+### Linting samplesheets (`preface lint`)
 
-- Example: `./examples/config.txt`
-- Tab-separated file with at least four columns.
-- The name of these columns (passed as a header) must be `ID`, `filepath`, `gender` and `FF`.
-    - `ID` is used to specify a mandatory unique identifier to each of the samples.
-    - The `filepath` column holds the full absolute path of the training copy number alteration files.
-    - The possible values for `gender` are either `M` (male) or `F` (female), representing fetal gender. Twins/triplets/... can be included if they are all male or all female.
-    - The `FF` column contains the response variable (the 'true' fetal fraction). One can use any method he/she believes performs best at quantifying the actual fetal fraction. PREFACE was benchmarked using the number of mapped Y-reads, referred to as FFY. As FFY is not informative for female fetuses, this measure is ignored for cases labeled with `F`, unless the `--femprop` flag is given (see below).
+Validate any YAML or JSON samplesheet against the PREFACE JSON Schema:
+
+```bash
+pixi run preface lint examples/samplesheet.yaml
+```
 
 ## Calculating baseline FFY (`preface ffy`)
 
 `preface ffy` implements the two-stage baseline `FFY` calculation described in Section 3.4 of the [PREFACE paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC6771918/):
 
 1. Each chromosome `Y` bin count is normalized by the sample's mappable diploid autosomal read density (excluding chromosomes `13`, `18`, and `21`). Pseudoautosomal regions (`PAR1` $\le 2.78\text{ Mb}$, `PAR2`) and `Yq12` heterochromatin ($\ge 28.8\text{ Mb}$) are masked when computing the summary chromosome `Y` depth.
-2. In cohort mode, fetal sex (`M` or `F`) is taken from the input table when present or inferred via a two-component Gaussian mixture model (or `--yfrac` threshold). Prior `FFY` is scaled between the female cohort median (`0%`) and the 100% male baseline (either empirical adult male liquid biopsies passed via `--male-ref` or theoretical diploid autosomal scaling $2 \times Y_{\text{norm}}$). A 10-fold cross-validated non-negative Lasso model ($\lambda = 10^{-4}$) is then fit across the chromosome `Y` bins to weight informative male-specific loci and produce the final `FF` column (`0.0` for females, clamped `[0, 100]` `%` for males).
+2. In cohort mode, fetal `sex` (`M` or `F`) is taken from the samplesheet when present or inferred via a two-component Gaussian mixture model (or `--yfrac` threshold). Prior `FFY` is scaled between the female cohort median (`0.0`) and the 100% male baseline (either empirical adult male liquid biopsies passed via `--male-ref` or theoretical diploid autosomal scaling $2 \times Y_{\text{norm}}$). A 10-fold cross-validated non-negative Lasso model ($\lambda = 10^{-4}$) is then fit across the chromosome `Y` bins to weight informative male-specific loci and produce the final `ff` value (`0.0` for females, clamped `[0.0, 1.0]` for males).
 
-### Cohort mode (generate `config.txt` for `preface train`)
+### Cohort mode (populate `sex` and `ff` in a samplesheet)
 
 ```bash
-pixi run preface ffy --config path/to/manifest.txt --outfile path/to/config.txt [optional arguments]
+pixi run preface ffy -s path/to/samplesheet.yaml --outfile path/to/samplesheet_with_ffy.yaml [optional arguments]
 ```
-
-The input `--config` manifest is a tab-separated file with required column `ID` and at least one of `filepath` or `reads_filepath`, plus optional column `gender`:
-- If both `reads_filepath` and `filepath` are present, `preface ffy` reads the `.bam`/`.cram` or binned read count `.bed` file (such as `./examples/counts.bed`) from `reads_filepath` while keeping `filepath` (the copy number alteration `.bed` file for `preface train`, such as `./examples/infile.bed`) unchanged in the output `config.txt`.
-- If only `reads_filepath` or only `filepath` is present, `preface ffy` reads the counts or alignments from that column and writes it to the `filepath` column of the output `config.txt`.
-- If `gender` (`M` or `F`) is omitted or `NA`, `preface ffy` fills it in automatically.
 
 ### Single-sample mode
 
 ```bash
-pixi run preface ffy --infile ./examples/counts.bed [--model path/to/ffy_model.onnx] [--json]
+pixi run preface ffy --infile path/to/sample.bam [--model path/to/ffy_model.onnx] [--json]
 ```
 
-In single-sample mode, `preface ffy` prints `gender` and `FFY` to stdout (or writes JSON when `--json` is passed). When `--model` is provided, it applies the cohort-calibrated ONNX Lasso weights and sex threshold saved via `--save-model`; otherwise, it computes `FFY` directly from the PAR-masked and heterochromatin-masked diploid autosomal ratio.
+In single-sample mode, `preface ffy` prints `sex` and `FFY` (as a `0.0`–`1.0` fraction) to stdout (or writes JSON when `--json` is passed).
 
 | Optional argument | Function |
 | :--- | :--- |
-| `--config x` | Cohort TSV file with `ID`, `filepath`, and optional `reads_filepath` and `gender` columns. |
-| `--infile x` | Single-sample `.bam`/`.cram` or 4-column binned read count `.bed`/`.tsv` file (e.g. `./examples/counts.bed`). |
-| `--outfile x` | Destination path for the generated `config.txt` in cohort mode. (default: stdout) |
-| `--male-ref x` | One or more 100% male reference samples (liquid biopsies) for empirical denominator scaling. Defaults to theoretical diploid autosomal scaling ($2 \times Y_{\text{norm}}$) when omitted. |
+| `-s`, `--samplesheet x` | Cohort samplesheet file (`.yaml`, `.yml`, or `.json`). |
+| `--infile x` | Single-sample `.bam`, `.cram`, or `.sam` alignment file. |
+| `--outfile x` | Destination path (`.yaml`, `.yml`, or `.json`) for the populated samplesheet in cohort mode. (default: stdout) |
+| `--male-ref x` | One or more 100% male reference alignment files (liquid biopsies) for empirical denominator scaling. Defaults to theoretical diploid autosomal scaling ($2 \times Y_{\text{norm}}$) when omitted. |
 | `--save-model x` | Export the calibrated cohort Lasso FFY model and baselines to an ONNX file. |
 | `--model x` | Load a calibrated FFY ONNX model in single-sample mode. |
-| `--binsize x` | Genomic bin size in bp when binning aligned `.bam`/`.cram` files. (default: `x=5000`) |
+| `--binsize x` | Genomic bin size in bp when binning aligned reads. (default: `x=5000`) |
 | `--mapq x` | Minimum mapping quality for aligned reads. (default: `x=1`) |
-| `--yfrac x` | Explicit normalized chrY depth threshold for `M`/`F` classification (overrides 2-component GMM). |
-| `--lambda x` | Lasso regularization penalty $\lambda$ for 5 kb chrY bin weighting. (default: `x=1e-4`) |
+| `--yfrac x` | Explicit normalized chrY depth threshold for `M`/`F` sex classification (overrides 2-component GMM). |
+| `--lambda x` | Lasso regularization penalty $\lambda$ for chrY bin weighting. (default: `x=1e-4`) |
 | `--reference x` | Reference genome FASTA file for `.cram` decoding. |
 | `--json [x]` | In single-sample mode, write predictions as JSON to stdout or to file `x`. |
 | `--cpus x` | Number of CPU threads for parallel sample loading. (default: all available cores) |
 | `--seed x` | Random seed for reproducible cross-validation. (default: `x=1`) |
 | `--loglevel x` | Logging verbosity level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). (default: `x=INFO`) |
 
-## Model training
+## Model training (`preface train`)
 
 ```bash
-pixi run preface train --config path/to/config.txt --outdir path/to/dir/ [optional arguments]
+pixi run preface train -s path/to/samplesheet.yaml --outdir path/to/dir/ [optional arguments]
 ```
+
+If `sex` or `ff` is omitted (`null`) in the input samplesheet, `preface train` automatically runs cohort `FFY` estimation prior to training.
 
 | Optional argument | Function |
 | :--- | :--- |
+| `-s`, `--samplesheet x` | Training samplesheet file (`.yaml`, `.yml`, or `.json`). |
+| `--outdir x` | Output directory for trained `model.onnx` and diagnostic plots. |
 | `--nfeat x` | Number of principal components to use during modeling. (default: `x=50`) |
 | `--hidden x` | Number of hidden units used in neural network. Use with caution. (default: `x=2`) |
 | `--cpus x` | Number of CPU threads for parallel file loading and linear algebra. (default: all available cores) |
-| `--femprop` | When using FFY as FF (recommended), FF labels for female fetuses are irrelevant, and should be ignored in the supervised learning phase (default). If this behavior is not desired, use this flag, which demands that the given FFs for female fetuses are proportional to their actual FF. |
-| `--olm` | It might be possible the neural network does not converge; or for your kind of data/sample size, an ordinary linear model might be a better option. In these cases, use this flag. |
-| `--noskewcorrect` | This flag ascertains the best fit for most (instead of all) of the data is generated. Mostly not recommended. |
-| `--device x` | Compute accelerator to use (`auto`, `cpu`, `cuda`, `mps`). Selects CUDA or Apple Silicon MPS when available. (default: `auto`) |
+| `--femprop` | Include female fetuses in supervised learning phase (requires proportional `ff` labels for females). |
+| `--olm` | Use an ordinary linear model instead of a neural network. |
+| `--noskewcorrect` | Disable linear skew correction on cross-validated predictions. |
+| `--binsize x` | Genomic bin width in bp for autosomal and chrX feature extraction. (default: `x=100000`) |
+| `--ffy-binsize x` | Genomic bin width in bp on chrY when auto-estimating FFY. (default: `x=5000`) |
+| `--mapq x` | Minimum mapping quality for aligned reads. (default: `x=1`) |
+| `--reference x` | Reference genome FASTA file for `.cram` decoding. |
+| `--male-ref x` | One or more 100% male reference alignment files when auto-estimating FFY. |
+| `--device x` | Compute accelerator to use (`auto`, `cpu`, `cuda`, `mps`). (default: `auto`) |
 | `--seed x` | Random seed for reproducible shuffling, cross-validation, and initialization. (default: `x=1`) |
 | `--loglevel x` | Logging verbosity level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). (default: `x=INFO`) |
 
-Training writes `model.onnx` into `--outdir` as a self-contained ONNX graph that embeds NA mean-imputation, PCA centering and projection, the neural network or linear model weights, skew correction, and FFX regression parameters. It also writes `overall_performance.png`, per-fold plots under `training_repeats/repeat_1.png` through `repeat_10.png`, `FFX.png`, and `training_statistics.txt`.
+Training writes `model.onnx` into `--outdir` as a self-contained ONNX graph that embeds bin size metadata, NA mean-imputation, PCA centering and projection, the neural network or linear model weights, skew correction, and FFX regression parameters. It also writes `overall_performance.png`, per-fold plots under `training_repeats/repeat_1.png` through `repeat_10.png`, `FFX.png`, and `training_statistics.txt`.
 
-## Predicting
+## Predicting (`preface predict`)
 
 ```bash
-pixi run preface predict --infile path/to/infile.bed --model path/to/model.onnx [optional arguments]
+pixi run preface predict --infile path/to/sample.bam --model path/to/model.onnx [optional arguments]
 ```
 
 | Optional argument | Function |
 | :--- | :--- |
+| `--infile x` | Sample `.bam`, `.cram`, or `.sam` alignment file. |
+| `--model x` | Trained `model.onnx` file. |
+| `--mapq x` | Minimum mapping quality for aligned reads. (default: `x=1`) |
+| `--reference x` | Reference genome FASTA file for `.cram` decoding. |
 | `--json [x]` | Predictions are written to stdout. Use `--json` for JSON format on stdout, or provide `--json path/to/output.json` to write to a JSON file. |
 | `--device x` | Execution device for ONNX Runtime (`auto`, `cpu`, `cuda`, `mps`). (default: `auto`) |
 | `--loglevel x` | Logging verbosity level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). (default: `x=INFO`) |
@@ -156,7 +150,7 @@ pixi run preface predict --infile path/to/infile.bed --model path/to/model.onnx 
 ## Model optimization
 
 - The most important parameter is `--nfeat`:
-    - It represents the number of principal components (PCs) that will be used as features during model training. Depending on the used copy number alteration software, bin size and the number of training samples, it might have different optimal values. In general, it is recommended to train a model using the default parameters. The output will contain a plot that enables you to review the selected `--nfeat`. Two parts should be seen in the proportion of variance across the principal components (indexed in order of importance):
+    - It represents the number of principal components (PCs) that will be used as features during model training. Depending on the bin size and the number of training samples, it might have different optimal values. In general, it is recommended to train a model using the default parameters. The output will contain a plot that enables you to review the selected `--nfeat`. Two parts should be seen in the proportion of variance across the principal components (indexed in order of importance):
         - A 'random' phase (representing PCs that explain variance caused by, inter alia, fetal fraction).
         - A 'non-random' phase (representing PCs that explain variance caused by natural Gaussian noise).
     - An optimal `--nfeat` captures the 'random' phase (as shown in the example at `./examples/overall_performance.png`). Capturing too much of the 'non-random' phase could lead to convergence problems during modeling.
