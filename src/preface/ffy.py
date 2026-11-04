@@ -9,16 +9,20 @@ from pathlib import Path
 import numpy as np
 
 from preface.io import (
-    FFY_TARGET_CHRS,
     SampleEntry,
-    compute_autosomal_density,
-    emit_prediction_output,
-    load_samplesheet,
-    parallel_load_samples,
-    read_alignment_bins,
-    write_samplesheet,
+    SampleYProfile,
+    align_to_loci,
+    extract_unified_sample,
 )
 from preface.logging_utils import get_logger
+from preface.math_utils import (
+    fit_lasso_fista,
+    format_stat,
+    get_m_diff,
+    get_sd_diff,
+    infer_sex_gmm_1d,
+    pearson_cor,
+)
 
 logger = get_logger(__name__)
 
@@ -27,13 +31,24 @@ CHRY_HETEROCHROMATIN_START: int = 28_800_000
 
 
 @dataclass(frozen=True)
-class SampleYProfile:
-    """Normalized chromosome Y bin depths and coordinates for a single sample."""
+class FFYTrainingResult:
+    """Calibrated FFY model parameters, updated samplesheet entries, and summary statistics."""
 
+    entries: list[SampleEntry]
+    intercept: float
+    weights: np.ndarray
     bin_loci: list[str]
-    bin_starts: np.ndarray
-    bin_ends: np.ndarray
-    y_norm_bins: np.ndarray
+    informative_indices: list[int]
+    female_baseline: float
+    male_100_baseline: float
+    yfrac_threshold: float
+    binsize: int
+    no_female_gate: bool
+    n_males: int
+    n_females: int
+    cv_cor: float
+    cv_mae: float
+    cv_sd: float
 
 
 def _coordinate_informative_mask(starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
@@ -55,169 +70,52 @@ def extract_sample_y_profile(
     index: Path | None = None,
 ) -> SampleYProfile:
     """Extract diploid-normalized chromosome Y bin profile from an alignment file."""
-    ref_lengths, bin_counts = read_alignment_bins(
+    data = extract_unified_sample(
         input_path,
-        binsize=binsize,
+        ffy_binsize=binsize,
         mapq=mapq,
         reference=reference,
-        target_chrs=FFY_TARGET_CHRS,
         index=index,
+        include_cn=False,
+        include_ffy=True,
     )
-    if "Y" not in ref_lengths or "Y" not in bin_counts:
-        raise ValueError(
-            "Alignment header does not contain chromosome Y ('Y' or 'chrY')."
-        )
-
-    r_auto = compute_autosomal_density(ref_lengths, bin_counts, binsize)
-
-    y_len = ref_lengths["Y"]
-    y_starts0 = np.arange(0, y_len, binsize, dtype=np.int64)
-    y_starts = y_starts0 + 1
-    y_ends = np.minimum(y_starts0 + binsize, y_len)
-    y_widths = np.maximum(1, y_ends - y_starts0).astype(np.float64)
-    y_counts = bin_counts["Y"].astype(np.float64)
-
-    y_norm = np.where(
-        np.isfinite(y_counts),
-        y_counts / (r_auto * y_widths),
-        np.nan,
-    )
-    bin_loci = [f"Y:{int(s)}-{int(e)}" for s, e in zip(y_starts, y_ends)]
-
+    assert data.y_profile is not None
     logger.debug(
         "Extracted chrY profile from '%s': %d chrY bins",
         input_path,
-        len(bin_loci),
+        len(data.y_profile.bin_loci),
     )
-    return SampleYProfile(
-        bin_loci=bin_loci,
-        bin_starts=y_starts,
-        bin_ends=y_ends,
-        y_norm_bins=y_norm,
-    )
+    return data.y_profile
 
 
-def _align_profile_to_loci(
-    profile: SampleYProfile, target_loci: list[str]
-) -> np.ndarray:
-    if profile.bin_loci == target_loci:
-        return np.nan_to_num(profile.y_norm_bins, nan=0.0)
-    locus_map = dict(zip(profile.bin_loci, profile.y_norm_bins))
-    arr = np.array([locus_map.get(loc, 0.0) for loc in target_loci], dtype=np.float64)
-    return np.nan_to_num(arr, nan=0.0)
-
-
-def _extract_profile_worker(
-    args: tuple[Path, int, int, Path | None, Path | None],
-) -> SampleYProfile:
-    path, binsize, mapq, reference, index = args
-    return extract_sample_y_profile(
-        path, binsize=binsize, mapq=mapq, reference=reference, index=index
-    )
-
-
-def run_ffy_single(
-    infile: Path,
-    model_path: Path | None = None,
-    binsize: int = 5000,
-    mapq: int = 1,
-    yfrac: float | None = None,
-    reference: Path | None = None,
-    json_arg: str | None = None,
-    device_name: str = "auto",
-) -> tuple[str, float]:
-    """Calculate sex and baseline FFY (0-1 fraction) for a single BAM/CRAM/SAM sample."""
-    from preface.models import load_ffy_onnx_metadata, run_ffy_onnx_inference
-
-    if model_path is not None:
-        if not model_path.is_file():
-            raise FileNotFoundError(f"The file '{model_path}' does not exist.")
-        meta = load_ffy_onnx_metadata(model_path)
-        profile = extract_sample_y_profile(
-            infile, binsize=meta.binsize, mapq=mapq, reference=reference
-        )
-        aligned_y = _align_profile_to_loci(profile, meta.bin_loci)
-        info_idx = np.asarray(meta.informative_indices, dtype=np.int64)
-        y_score = (
-            float(np.mean(aligned_y[info_idx]))
-            if info_idx.size > 0
-            else float(np.mean(aligned_y))
-        )
-        thresh = yfrac if yfrac is not None else meta.yfrac_threshold
-        sex = "M" if y_score >= thresh else "F"
-        ffy = (
-            run_ffy_onnx_inference(model_path, aligned_y, device_name)
-            if sex == "M"
-            else 0.0
-        )
-    else:
-        profile = extract_sample_y_profile(
-            infile, binsize=binsize, mapq=mapq, reference=reference
-        )
-        coord_mask = _coordinate_informative_mask(profile.bin_starts, profile.bin_ends)
-        vals = profile.y_norm_bins[coord_mask]
-        finite_vals = vals[np.isfinite(vals)]
-        if finite_vals.size == 0:
-            raise ValueError(f"Sample '{infile}' has no finite chromosome Y bins.")
-        y_score = float(np.mean(finite_vals))
-        thresh = yfrac if yfrac is not None else 0.01
-        sex = "M" if y_score >= thresh else "F"
-        ffy = float(np.clip(2.0 * y_score, 0.0, 1.0)) if sex == "M" else 0.0
-
-    logger.debug("Single-sample FFY for '%s': sex=%s, FFY=%.6f", infile, sex, ffy)
-    emit_prediction_output(
-        [f"sex = {sex}", f"FFY = {ffy:.4g}"],
-        {"FFY": ffy, "sex": sex},
-        json_arg,
-    )
-    return sex, ffy
-
-
-def estimate_cohort_ffy(
+def fit_cohort_ffy_from_profiles(
     entries: Sequence[SampleEntry],
-    male_ref_paths: list[Path] | None = None,
-    save_model_path: Path | None = None,
+    cohort_profiles: Sequence[SampleYProfile],
+    lb_profiles: Sequence[SampleYProfile] | None = None,
     binsize: int = 5000,
-    mapq: int = 1,
     yfrac: float | None = None,
     lasso_lambda: float = 1e-4,
-    reference: Path | None = None,
-    cpus: int = 1,
+    no_female_gate: bool = False,
     seed: int = 1,
-) -> list[SampleEntry]:
-    """Estimate baseline FFY (0-1 fraction) and sex across a cohort of SampleEntry objects."""
-    from preface.math_utils import fit_lasso_fista, infer_sex_gmm_1d
-    from preface.models import export_ffy_model_to_onnx
-
+) -> FFYTrainingResult:
+    """Fit 2-GMM sex classification and non-negative Lasso FFY calibration on extracted chrY profiles."""
     entry_list = list(entries)
     n_samples = len(entry_list)
     if n_samples == 0:
         raise ValueError("Samplesheet contains no samples.")
+    if len(cohort_profiles) != n_samples:
+        raise ValueError("Mismatch between cohort entries and extracted chrY profiles.")
 
     rng = np.random.default_rng(seed)
 
-    combined_items: list[
-        tuple[str, tuple[Path, int, int, Path | None, Path | None]]
-    ] = [
-        (entry.id, (entry.filepath, binsize, mapq, reference, entry.index))
-        for entry in entry_list
-    ]
-    if male_ref_paths:
-        combined_items.extend(
-            (f"male_ref:{p.name}", (p, binsize, mapq, reference, None))
-            for p in male_ref_paths
-        )
-
-    logger.info("Extracting chrY profiles for %d cohort samples ...", n_samples)
-    all_profiles = parallel_load_samples(
-        combined_items, _extract_profile_worker, cpus=cpus
-    )
-    cohort_profiles = all_profiles[:n_samples]
-    lb_profiles = all_profiles[n_samples:]
-
     first_prof = cohort_profiles[0]
     ref_loci = first_prof.bin_loci
-    y_matrix = np.vstack([_align_profile_to_loci(p, ref_loci) for p in cohort_profiles])
+    y_matrix = np.vstack(
+        [
+            align_to_loci(p.bin_loci, p.y_norm_bins, ref_loci, fill_nan=0.0)
+            for p in cohort_profiles
+        ]
+    )
 
     coord_mask = _coordinate_informative_mask(
         first_prof.bin_starts, first_prof.bin_ends
@@ -280,7 +178,10 @@ def estimate_cohort_ffy(
             len(lb_profiles),
         )
         lb_matrix = np.vstack(
-            [_align_profile_to_loci(p, ref_loci) for p in lb_profiles]
+            [
+                align_to_loci(p.bin_loci, p.y_norm_bins, ref_loci, fill_nan=0.0)
+                for p in lb_profiles
+            ]
         )
         male_100_baseline = float(np.median(np.mean(lb_matrix[:, info_mask], axis=1)))
     else:
@@ -293,10 +194,11 @@ def estimate_cohort_ffy(
     )
 
     denom = max(male_100_baseline - female_baseline, 1e-6)
-    prior_ffy = np.zeros(n_samples, dtype=np.float64)
-    prior_ffy[male_mask] = np.clip(
-        (y_scores[male_mask] - female_baseline) / denom, 0.0, 1.0
-    )
+    unclamped_prior = np.clip((y_scores - female_baseline) / denom, 0.0, 1.0)
+    if no_female_gate:
+        prior_ffy = unclamped_prior
+    else:
+        prior_ffy = np.where(male_mask, unclamped_prior, 0.0)
 
     x_lasso = np.zeros_like(y_matrix)
     x_lasso[:, info_mask] = y_matrix[:, info_mask]
@@ -321,7 +223,10 @@ def estimate_cohort_ffy(
                 x_lasso[train_mask, :], prior_ffy[train_mask], lam=lasso_lambda
             )
             cv_preds[test_idx] = b0 + x_lasso[test_idx, :] @ w_fold
-        final_ffy = np.where(male_mask, np.clip(cv_preds, 0.0, 1.0), 0.0)
+        clipped_cv = np.clip(cv_preds, 0.0, 1.0)
+        final_ffy = (
+            clipped_cv if no_female_gate else np.where(male_mask, clipped_cv, 0.0)
+        )
     else:
         logger.warning(
             "Fewer than 4 male/total samples (%d male, %d total); skipping CV Lasso and using prior FFY.",
@@ -330,21 +235,21 @@ def estimate_cohort_ffy(
         )
         final_ffy = prior_ffy.copy()
 
-    if save_model_path is not None:
-        full_b0, full_w = fit_lasso_fista(x_lasso, prior_ffy, lam=lasso_lambda)
-        export_ffy_model_to_onnx(
-            intercept=full_b0,
-            weights=full_w,
-            bin_loci=ref_loci,
-            informative_indices=info_indices,
-            female_baseline=female_baseline,
-            male_100_baseline=male_100_baseline,
-            yfrac_threshold=learned_thresh,
-            binsize=binsize,
-            onnx_path=save_model_path,
-        )
+    full_b0, full_w = fit_lasso_fista(x_lasso, prior_ffy, lam=lasso_lambda)
 
-    return [
+    eval_target = np.array(
+        [
+            float(e.ff) if e.ff is not None else float(p)
+            for e, p in zip(entry_list, prior_ffy)
+        ],
+        dtype=np.float64,
+    )
+    eval_mask = male_mask if np.any(male_mask) else np.ones(n_samples, dtype=bool)
+    cv_cor = pearson_cor(final_ffy[eval_mask], eval_target[eval_mask])
+    cv_mae = get_m_diff(final_ffy[eval_mask], eval_target[eval_mask], use_abs=True)
+    cv_sd = get_sd_diff(final_ffy[eval_mask], eval_target[eval_mask])
+
+    updated_entries = [
         SampleEntry(
             id=entry.id,
             filepath=entry.filepath,
@@ -355,37 +260,35 @@ def estimate_cohort_ffy(
         for entry, sex, ffy_val in zip(entry_list, sexes, final_ffy)
     ]
 
-
-def run_ffy_cohort(
-    samplesheet_path: Path,
-    outfile: Path | None = None,
-    male_ref_paths: list[Path] | None = None,
-    save_model_path: Path | None = None,
-    binsize: int = 5000,
-    mapq: int = 1,
-    yfrac: float | None = None,
-    lasso_lambda: float = 1e-4,
-    reference: Path | None = None,
-    cpus: int = 1,
-    seed: int = 1,
-) -> list[SampleEntry]:
-    """Calculate baseline FFY and sex across a cohort samplesheet per PMC6771918 Section 3.4."""
-    from preface.hardware import configure_hardware
-
-    resolved_cpus = configure_hardware(cpus=cpus, seed=seed)
-    entries = load_samplesheet(samplesheet_path)
-    updated_entries = estimate_cohort_ffy(
-        entries=entries,
-        male_ref_paths=male_ref_paths,
-        save_model_path=save_model_path,
+    return FFYTrainingResult(
+        entries=updated_entries,
+        intercept=full_b0,
+        weights=full_w,
+        bin_loci=ref_loci,
+        informative_indices=info_indices,
+        female_baseline=female_baseline,
+        male_100_baseline=male_100_baseline,
+        yfrac_threshold=learned_thresh,
         binsize=binsize,
-        mapq=mapq,
-        yfrac=yfrac,
-        lasso_lambda=lasso_lambda,
-        reference=reference,
-        cpus=resolved_cpus,
-        seed=seed,
+        no_female_gate=no_female_gate,
+        n_males=n_males,
+        n_females=n_females,
+        cv_cor=cv_cor,
+        cv_mae=cv_mae,
+        cv_sd=cv_sd,
     )
-    default_fmt = "json" if samplesheet_path.suffix.lower() == ".json" else "yaml"
-    write_samplesheet(updated_entries, outfile=outfile, default_format=default_fmt)
-    return updated_entries
+
+
+def format_ffy_statistics_lines(result: FFYTrainingResult) -> list[str]:
+    """Format human-readable FFY model statistics lines."""
+    return [
+        "FFY - Baseline Chromosome Y Fetal Fraction Model",
+        f"Cohort sex classification: {result.n_males} male, {result.n_females} female",
+        f"Sex classification threshold (yfrac): {format_stat(result.yfrac_threshold)}",
+        f"Female baseline depth: {format_stat(result.female_baseline)}",
+        f"100% male baseline depth: {format_stat(result.male_100_baseline)}",
+        f"Informative chrY bins: {len(result.informative_indices)} / {len(result.bin_loci)} (binsize={result.binsize} bp)",
+        f"Female FFY gating disabled (--no-female-gate): {result.no_female_gate}",
+        f"FFY Lasso CV correlation (r): {format_stat(result.cv_cor)}",
+        f"FFY Lasso CV MAE: {format_stat(result.cv_mae)} ± {format_stat(result.cv_sd)}",
+    ]

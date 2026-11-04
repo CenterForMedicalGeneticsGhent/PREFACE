@@ -13,18 +13,18 @@ import torch
 import yaml
 from typer.testing import CliRunner
 
-from preface.cli import _normalize_argv, app
-from preface.ffy import (
-    extract_sample_y_profile,
-    run_ffy_single,
-)
+from preface.cli import app
+from preface.ffy import extract_sample_y_profile
 from preface.hardware import configure_hardware, get_onnx_providers, resolve_device
 from preface.io import (
+    ALL_TARGET_CHRS,
     FFY_TARGET_CHRS,
     _read_bam_native,
+    extract_unified_sample,
     load_samplesheet,
     load_training_dataset,
     parallel_load_samples,
+    read_alignment_multi_bins,
     validate_samplesheet_data,
     write_samplesheet,
 )
@@ -38,15 +38,18 @@ from preface.math_utils import (
     rlm_huber,
 )
 from preface.models import (
+    MODEL_TYPE_ALL,
+    MODEL_TYPE_PREFACE,
     export_pipeline_to_onnx,
-    load_ffy_onnx_metadata,
+    export_unified_pipeline_to_onnx,
     load_onnx_metadata,
     predict_model,
     run_onnx_inference,
+    run_unified_onnx_inference,
     train_neural_net,
     train_olm,
 )
-from preface.pipeline import run_predict, run_train
+from preface.pipeline import resolve_prefix_paths, run_predict, run_train
 
 runner = CliRunner()
 
@@ -136,6 +139,28 @@ def test_hardware_resolution() -> None:
     assert providers == ["CPUExecutionProvider"]
 
 
+def test_prefix_resolution(tmp_path: Path) -> None:
+    file_prefix = tmp_path / "run_out"
+    paths_file = resolve_prefix_paths(file_prefix)
+    assert paths_file.onnx_path == tmp_path / "run_out.onnx"
+    assert paths_file.samplesheet_path == tmp_path / "run_out.samplesheet.yaml"
+    assert (
+        paths_file.training_stats_path == tmp_path / "run_out.training_statistics.txt"
+    )
+    assert paths_file.ffy_stats_path == tmp_path / "run_out.ffy_statistics.txt"
+    assert paths_file.overall_plot_path == tmp_path / "run_out.overall_performance.png"
+    assert paths_file.ffx_plot_path == tmp_path / "run_out.FFX.png"
+    assert paths_file.repeats_dir == tmp_path / "run_out.training_repeats"
+    assert paths_file.predict_json_path == tmp_path / "run_out.json"
+
+    dir_prefix = tmp_path / "dir_out"
+    paths_dir = resolve_prefix_paths(f"{dir_prefix.as_posix()}/")
+    assert dir_prefix.is_dir()
+    assert paths_dir.onnx_path == dir_prefix / "model.onnx"
+    assert paths_dir.samplesheet_path == dir_prefix / "samplesheet.yaml"
+    assert paths_dir.predict_json_path == dir_prefix / "predictions.json"
+
+
 def test_math_utils_pca_ols_rlm() -> None:
     rng = np.random.default_rng(7)
     x = rng.normal(size=(30, 80))
@@ -166,7 +191,7 @@ def test_math_utils_pca_ols_rlm() -> None:
     assert np.isclose(pearson_cor(t, y), 1.0)
 
 
-def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
+def test_models_and_unified_onnx_roundtrip(tmp_path: Path) -> None:
     rng = np.random.default_rng(1)
     n_samples, n_raw_features, n_feat = 40, 25, 4
     raw_x = rng.normal(size=(n_samples, n_raw_features))
@@ -185,7 +210,7 @@ def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
     nn_preds = predict_model(nn_model, x_pc, device=torch.device("cpu"))
     assert pearson_cor(nn_preds, true_y) > 0.95
 
-    onnx_path = tmp_path / "model.onnx"
+    onnx_path = tmp_path / "preface_only.onnx"
     feature_names = [
         f"1:{i * 5000 + 1}-{(i + 1) * 5000}" for i in range(n_raw_features)
     ]
@@ -204,6 +229,7 @@ def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
     )
 
     meta = load_onnx_metadata(onnx_path)
+    assert meta.model_type == MODEL_TYPE_PREFACE
     assert meta.possible_features == feature_names
     assert np.isclose(meta.the_intercept_x, 0.99)
     assert np.isclose(meta.the_slope_x, -0.5)
@@ -225,6 +251,79 @@ def test_models_and_onnx_roundtrip(tmp_path: Path) -> None:
 
     onnx_pred = run_onnx_inference(onnx_path, sample_with_nan, requested_device="cpu")
     assert np.isclose(onnx_pred, expected_final, atol=1e-4)
+
+    # Test unified FFY + FFX + PREFACE ONNX export and female gating toggle
+    unified_onnx = tmp_path / "unified.onnx"
+    y_loci = [f"Y:{i * 5000 + 1}-{(i + 1) * 5000}" for i in range(6)]
+    ffy_weights = np.array([0.0, 0.5, 0.5, 0.5, 0.5, 0.0], dtype=np.float64)
+    export_unified_pipeline_to_onnx(
+        predictor=nn_model,
+        mean_features=mean_features,
+        pca_center=pca_res.center,
+        pca_rotation=pca_res.rotation[:, :n_feat],
+        the_intercept=0.005,
+        the_slope=1.05,
+        the_intercept_x=0.99,
+        the_slope_x=-0.5,
+        possible_features=feature_names,
+        ffy_intercept=0.01,
+        ffy_weights=ffy_weights,
+        bin_loci=y_loci,
+        informative_indices=[1, 2, 3, 4],
+        female_baseline=0.002,
+        male_100_baseline=0.502,
+        yfrac_threshold=0.02,
+        onnx_path=unified_onnx,
+        binsize=5000,
+        ffy_binsize=5000,
+        no_female_gate=False,
+    )
+    u_meta = load_onnx_metadata(unified_onnx)
+    assert u_meta.model_type == MODEL_TYPE_ALL
+
+    # Male sample (y_score = 0.05 >= 0.02)
+    y_male = np.array([0.001, 0.05, 0.05, 0.05, 0.05, 0.001], dtype=np.float64)
+    res_male = run_unified_onnx_inference(
+        unified_onnx,
+        u_meta,
+        feature_ratios=sample_with_nan,
+        x_ratio=0.94,
+        aligned_y=y_male,
+        requested_device="cpu",
+    )
+    assert res_male.sex == "M"
+    assert res_male.ffy is not None and np.isclose(res_male.ffy, 0.11, atol=1e-4)
+    assert res_male.ffx is not None and np.isclose(res_male.ffx, 0.10, atol=1e-4)
+    assert res_male.preface is not None and np.isclose(
+        res_male.preface, expected_final, atol=1e-4
+    )
+
+    # Female sample (y_score = 0.005 < 0.02) with default gating vs --no-female-gate override
+    y_female = np.array([0.001, 0.005, 0.005, 0.005, 0.005, 0.001], dtype=np.float64)
+    res_fem_gated = run_unified_onnx_inference(
+        unified_onnx,
+        u_meta,
+        feature_ratios=sample_with_nan,
+        x_ratio=0.99,
+        aligned_y=y_female,
+        requested_device="cpu",
+    )
+    assert res_fem_gated.sex == "F"
+    assert res_fem_gated.ffy == 0.0
+
+    res_fem_ungated = run_unified_onnx_inference(
+        unified_onnx,
+        u_meta,
+        feature_ratios=sample_with_nan,
+        x_ratio=0.99,
+        aligned_y=y_female,
+        requested_device="cpu",
+        no_female_gate_override=True,
+    )
+    assert res_fem_ungated.sex == "F"
+    assert res_fem_ungated.ffy is not None and np.isclose(
+        res_fem_ungated.ffy, 0.02, atol=1e-4
+    )
 
 
 def test_samplesheet_lint_and_validation(tmp_path: Path) -> None:
@@ -257,7 +356,6 @@ def test_samplesheet_lint_and_validation(tmp_path: Path) -> None:
         )
         assert parsed_idx[0].index == idx_file
 
-    # Test rejection of invalid schema inputs
     invalid_cases = [
         ([], "non-empty"),
         ([{"id": "S1"}], "'filepath' is a required property"),
@@ -290,7 +388,6 @@ def test_samplesheet_lint_and_validation(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match=expected_err):
             validate_samplesheet_data(payload)
 
-    # Test file existence and readability checks for filepath and index
     with pytest.raises(FileNotFoundError, match="filepath .* does not exist"):
         validate_samplesheet_data(
             [{"id": "S1", "filepath": str(tmp_path / "missing.bam")}]
@@ -327,25 +424,26 @@ def test_samplesheet_lint_and_validation(tmp_path: Path) -> None:
         load_samplesheet(txt_file)
 
 
-def test_alignment_binning_and_bed_rejection(tmp_path: Path) -> None:
+def test_single_pass_alignment_binning_and_bed_rejection(tmp_path: Path) -> None:
     bed_file = tmp_path / "legacy.bed"
     bed_file.write_text("chr1\t0\t5000\t100\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Only aligned read files"):
         extract_sample_y_profile(bed_file)
 
     bam_path = tmp_path / "sample.bam"
-    refs = [("chr1", 10000), ("chrY", 10000)]
+    refs = [("chr1", 10000), ("chrX", 10000), ("chrY", 10000)]
     bin_reads = [
         (0, 100, 30, 0, 200),
         (0, 5100, 30, 0, 200),
-        (1, 200, 30, 0, 16),
-        (1, 5200, 30, 0, 16),
-        (1, 200, 30, 0x400, 50),  # duplicate flag -> skipped
-        (1, 200, 0, 0, 50),  # mapq 0 -> skipped when mapq=1
+        (1, 100, 30, 0, 190),
+        (1, 5100, 30, 0, 190),
+        (2, 200, 30, 0, 16),
+        (2, 5200, 30, 0, 16),
+        (2, 200, 30, 0x400, 50),  # duplicate flag -> skipped
+        (2, 200, 0, 0, 50),  # mapq 0 -> skipped when mapq=1
     ]
     _write_synthetic_bam_from_bin_counts(bam_path, refs, bin_reads)
 
-    # Test native BAM reader directly
     ref_lengths, bin_counts = _read_bam_native(
         bam_path, binsize=5000, mapq=1, target_chrs=FFY_TARGET_CHRS
     )
@@ -353,12 +451,24 @@ def test_alignment_binning_and_bed_rejection(tmp_path: Path) -> None:
     assert np.array_equal(bin_counts["1"], [200, 200])
     assert np.array_equal(bin_counts["Y"], [16, 16])
 
-    # Test extract_sample_y_profile & run_ffy_single (0-1 fraction)
-    prof_bam = extract_sample_y_profile(bam_path, binsize=5000, mapq=1)
-    assert np.allclose(prof_bam.y_norm_bins, [0.08, 0.08])
-    bam_sex, bam_ffy = run_ffy_single(bam_path, binsize=5000, mapq=1)
-    assert bam_sex == "M"
-    assert np.isclose(bam_ffy, 0.16)
+    # Single pass multi-binsize (e.g. 10000 bp for CN and 5000 bp for FFY)
+    ref_len_m, spec_counts = read_alignment_multi_bins(
+        bam_path,
+        bin_specs=[(10000, ALL_TARGET_CHRS), (5000, FFY_TARGET_CHRS)],
+        mapq=1,
+        reference=None,
+    )
+    assert ref_len_m["1"] == 10000
+    assert np.array_equal(spec_counts[0]["1"], [400])
+    assert np.array_equal(spec_counts[1]["Y"], [16, 16])
+
+    unified = extract_unified_sample(
+        bam_path, sample_id="S1", binsize=10000, ffy_binsize=5000, mapq=1
+    )
+    assert unified.x_ratio is not None and np.isclose(unified.x_ratio, 380.0 / 400.0)
+    assert unified.y_profile is not None and np.allclose(
+        unified.y_profile.y_norm_bins, [0.08, 0.08]
+    )
 
 
 def _create_synthetic_bam_cohort(
@@ -397,24 +507,20 @@ def _create_synthetic_bam_cohort(
         true_ffs.append(ff)
 
         bin_reads: list[tuple[int, int, int, int, int]] = []
-        # chr1 & chr2 (autosomal features encoding latent fetal signal)
         for b in range(n_chr1_bins):
             ratio_log2 = ff * latent_signal[b] + float(rng.normal(0.0, 0.005))
             cnt = max(1, round(base_depth * (2.0**ratio_log2)))
             bin_reads.append((0, b * binsize + 100, 30, 0, cnt))
         for b in range(n_chr2_bins):
             if b == 0:
-                # Always 0 reads in chr2 bin 0 -> tests NaN filtering/handling
                 continue
             ratio_log2 = ff * latent_signal[n_chr1_bins + b] + float(
                 rng.normal(0.0, 0.005)
             )
             cnt = max(1, round(base_depth * (2.0**ratio_log2)))
             bin_reads.append((1, b * binsize + 100, 30, 0, cnt))
-        # chr13 (excluded autosome)
         for b in range(n_chr13_bins):
             bin_reads.append((2, b * binsize + 100, 30, 0, int(base_depth)))
-        # chrX (copy-number ratio decreases linearly with male FF)
         x_scale = (1.0 - 0.5 * ff) if sex == "M" else 1.0
         for b in range(n_chrx_bins):
             cnt = max(
@@ -422,7 +528,6 @@ def _create_synthetic_bam_cohort(
                 round(base_depth * (x_scale + float(rng.normal(0.0, 0.002)))),
             )
             bin_reads.append((3, b * binsize + 100, 30, 0, cnt))
-        # chrY (bins 2..7 informative for male FF, bins 0..1 baseline noise)
         for b in range(n_chry_bins):
             if 2 <= b < 8:
                 y_frac = (0.002 + 0.5 * ff) if sex == "M" else 0.002
@@ -449,7 +554,7 @@ def _create_synthetic_bam_cohort(
     return samplesheet_path, bams_dir / "sample_0.bam", true_sexes, true_ffs
 
 
-def test_ffy_cohort_lasso_onnx_and_cli(tmp_path: Path) -> None:
+def test_train_ffy_and_preface_subtargets(tmp_path: Path) -> None:
     samplesheet_path, sample0_bam, true_sexes, true_ffs = _create_synthetic_bam_cohort(
         tmp_path, n_samples=24, binsize=5000
     )
@@ -460,97 +565,221 @@ def test_ffy_cohort_lasso_onnx_and_cli(tmp_path: Path) -> None:
         outfile=unlabeled_sheet,
     )
 
-    out_sheet = tmp_path / "samplesheet_out.json"
-    ffy_onnx = tmp_path / "ffy_model.onnx"
+    ffy_prefix = tmp_path / "ffy_step"
+    cache_npz = tmp_path / "cohort_counts.npz"
 
-    res_cli = runner.invoke(
+    # Step 1: `preface train ffy` with --cache-counts
+    res_ffy = runner.invoke(
         app,
         [
+            "train",
             "ffy",
             "-s",
             str(unlabeled_sheet),
-            "--outfile",
-            str(out_sheet),
-            "--save-model",
-            str(ffy_onnx),
-            "--binsize",
+            "--prefix",
+            str(ffy_prefix),
+            "--ffy-binsize",
             "5000",
+            "--cache-counts",
+            str(cache_npz),
             "--cpus",
             "2",
             "--seed",
             "1",
         ],
     )
-    assert res_cli.exit_code == 0, res_cli.stdout
-    assert out_sheet.is_file()
-    assert ffy_onnx.is_file()
+    assert res_ffy.exit_code == 0, res_ffy.output
+    assert cache_npz.is_file()
 
-    out_entries = load_samplesheet(out_sheet)
+    ffy_onnx = tmp_path / "ffy_step.onnx"
+    ffy_sheet = tmp_path / "ffy_step.samplesheet.yaml"
+    ffy_stats = tmp_path / "ffy_step.ffy_statistics.txt"
+    assert ffy_onnx.is_file()
+    assert ffy_sheet.is_file()
+    assert ffy_stats.is_file()
+    assert "FFY - Baseline Chromosome Y Fetal Fraction Model" in ffy_stats.read_text(
+        encoding="utf-8"
+    )
+
+    out_entries = load_samplesheet(ffy_sheet)
     assert [e.sex for e in out_entries] == true_sexes
     est_ffs = np.array([float(e.ff or 0.0) for e in out_entries])
     assert np.all((est_ffs >= 0.0) & (est_ffs <= 1.0))
     assert np.allclose(est_ffs[18:], 0.0)
     assert pearson_cor(est_ffs[:18], np.array(true_ffs[:18])) > 0.98
 
-    meta = load_ffy_onnx_metadata(ffy_onnx)
-    assert len(meta.bin_loci) == 10
-    assert meta.binsize == 5000
+    meta_ffy = load_onnx_metadata(ffy_onnx)
+    assert len(meta_ffy.bin_loci) == 10
+    assert meta_ffy.binsize == 5000
 
-    norm_args = _normalize_argv(
+    # Predict with FFY-only model (stdout percentage and --prefix JSON)
+    res_pred_ffy_txt = runner.invoke(
+        app,
         [
-            "ffy",
+            "predict",
             "--infile",
             str(sample0_bam),
             "--model",
             str(ffy_onnx),
             "--device",
             "cpu",
-            "--json",
-        ]
+        ],
     )
-    res_single = runner.invoke(app, norm_args)
-    assert res_single.exit_code == 0
-    payload = json.loads(res_single.stdout.strip())
-    assert payload["sex"] == "M"
-    assert 0.0 < payload["FFY"] <= 1.0
-    assert np.isclose(payload["FFY"], true_ffs[0], atol=0.02)
+    assert res_pred_ffy_txt.exit_code == 0
+    assert "sex = M" in res_pred_ffy_txt.stdout
+    assert "FFY =" in res_pred_ffy_txt.stdout and "%" in res_pred_ffy_txt.stdout
+    assert "PREFACE" not in res_pred_ffy_txt.stdout
 
+    ffy_pred_prefix = tmp_path / "ffy_pred_out"
+    res_pred_ffy_json = runner.invoke(
+        app,
+        [
+            "predict",
+            "--infile",
+            str(sample0_bam),
+            "--model",
+            str(ffy_onnx),
+            "--prefix",
+            str(ffy_pred_prefix),
+            "--device",
+            "cpu",
+        ],
+    )
+    assert res_pred_ffy_json.exit_code == 0
+    pred_ffy_payload = json.loads(
+        (tmp_path / "ffy_pred_out.json").read_text(encoding="utf-8")
+    )
+    assert pred_ffy_payload["sex"] == "M"
+    assert 0.0 < pred_ffy_payload["FFY"] <= 1.0
+    assert np.isclose(pred_ffy_payload["FFY"], true_ffs[0], atol=0.02)
+
+    # Female sample gating and --no-female-gate override
     fem_bam = entries[20].filepath
-    fem_sex, fem_ffy = run_ffy_single(fem_bam, model_path=ffy_onnx, device_name="cpu")
-    assert fem_sex == "F"
-    assert fem_ffy == 0.0
+    fem_res_gated = run_predict(fem_bam, ffy_onnx, device_name="cpu")
+    assert fem_res_gated.sex == "F"
+    assert fem_res_gated.ffy == 0.0
+    fem_res_ungated = run_predict(
+        fem_bam, ffy_onnx, no_female_gate=True, device_name="cpu"
+    )
+    assert fem_res_ungated.sex == "F"
+    assert fem_res_ungated.ffy is not None and fem_res_ungated.ffy >= 0.0
+
+    # Step 2: `preface train preface` (and alias `ffx`) fails on unlabeled sheet, succeeds on ffy_sheet
+    res_unlabeled_err = runner.invoke(
+        app,
+        [
+            "train",
+            "preface",
+            "-s",
+            str(unlabeled_sheet),
+            "--prefix",
+            str(tmp_path / "err_out"),
+        ],
+    )
+    assert res_unlabeled_err.exit_code != 0
+
+    ffx_prefix = tmp_path / "ffx_step"
+    res_ffx = runner.invoke(
+        app,
+        [
+            "train",
+            "ffx",
+            "-s",
+            str(ffy_sheet),
+            "--prefix",
+            str(ffx_prefix),
+            "--nfeat",
+            "3",
+            "--olm",
+            "--binsize",
+            "5000",
+            "--cpus",
+            "2",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert res_ffx.exit_code == 0, res_ffx.output
+    ffx_onnx = tmp_path / "ffx_step.onnx"
+    assert ffx_onnx.is_file()
+    assert load_onnx_metadata(ffx_onnx).model_type == MODEL_TYPE_PREFACE
 
 
-def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
-    samplesheet_path, sample_bam, _, _ = _create_synthetic_bam_cohort(
+def test_unified_single_pass_train_all_and_predict(tmp_path: Path) -> None:
+    samplesheet_path, sample_bam, _, true_ffs = _create_synthetic_bam_cohort(
         tmp_path, n_samples=24, binsize=5000
     )
-    outdir_nn = tmp_path / "out_nn"
+    entries = load_samplesheet(samplesheet_path)
+    unlabeled_sheet = tmp_path / "unlabeled_all.yaml"
+    write_samplesheet(
+        [type(e)(id=e.id, filepath=e.filepath, sex=None, ff=None) for e in entries],
+        outfile=unlabeled_sheet,
+    )
+
+    prefix_all = tmp_path / "unified_run"
+    cache_path = tmp_path / "unified_cache.npz"
 
     onnx_path = run_train(
-        samplesheet_path=samplesheet_path,
-        outdir=outdir_nn,
+        samplesheet_path=unlabeled_sheet,
+        prefix=prefix_all,
+        target="all",
         n_feat=3,
         hidden=2,
         cpus=2,
         olm=False,
         binsize=5000,
+        ffy_binsize=5000,
+        cache_counts=cache_path,
         device_name="cpu",
         seed=1,
     )
+    assert onnx_path == tmp_path / "unified_run.onnx"
     assert onnx_path.is_file()
-    assert (outdir_nn / "overall_performance.png").is_file()
-    assert (outdir_nn / "FFX.png").is_file()
-    assert (outdir_nn / "training_statistics.txt").is_file()
-    assert (outdir_nn / "training_repeats" / "repeat_1.png").is_file()
-    assert (outdir_nn / "training_repeats" / "repeat_10.png").is_file()
+    assert cache_path.is_file()
+    assert (tmp_path / "unified_run.samplesheet.yaml").is_file()
+    assert (tmp_path / "unified_run.overall_performance.png").is_file()
+    assert (tmp_path / "unified_run.FFX.png").is_file()
+    assert (tmp_path / "unified_run.training_statistics.txt").is_file()
+    assert (tmp_path / "unified_run.training_repeats" / "repeat_1.png").is_file()
+    assert (tmp_path / "unified_run.training_repeats" / "repeat_10.png").is_file()
 
-    stats_text = (outdir_nn / "training_statistics.txt").read_text(encoding="utf-8")
+    stats_text = (tmp_path / "unified_run.training_statistics.txt").read_text(
+        encoding="utf-8"
+    )
     assert "PREFACE - PREdict FetAl ComponEnt" in stats_text
+    assert "FFY - Baseline Chromosome Y Fetal Fraction Model" in stats_text
     assert "Overall correlation (r):" in stats_text
     assert "FF < 0.1 mean absolute error (MAE):" in stats_text
 
-    # Test CLI predict in default, bare --json, and --json <file> modes
+    # Re-run using cached counts (even with default `preface train` without explicit target)
+    prefix_cached = tmp_path / "cached_run"
+    res_cached = runner.invoke(
+        app,
+        [
+            "train",
+            "-s",
+            str(unlabeled_sheet),
+            "--prefix",
+            str(prefix_cached),
+            "--nfeat",
+            "3",
+            "--olm",
+            "--binsize",
+            "5000",
+            "--ffy-binsize",
+            "5000",
+            "--cache-counts",
+            str(cache_path),
+            "--cpus",
+            "2",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert res_cached.exit_code == 0, res_cached.output
+    assert (tmp_path / "cached_run.onnx").is_file()
+
+    # Unified `preface predict`: plain-text stdout (percentages) when --prefix omitted
     res_std = runner.invoke(
         app,
         [
@@ -564,20 +793,16 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
         ],
     )
     assert res_std.exit_code == 0
+    assert "sex = M" in res_std.stdout
+    assert "FFY =" in res_std.stdout
     assert "FFX =" in res_std.stdout
     assert "PREFACE =" in res_std.stdout
-    assert "%" not in res_std.stdout
+    for line in res_std.stdout.strip().splitlines():
+        if line.startswith(("FFY =", "FFX =", "PREFACE =")):
+            assert line.endswith("%")
 
-    norm_args = _normalize_argv(
-        ["predict", "--infile", str(sample_bam), "--model", str(onnx_path), "--json"]
-    )
-    res_json_stdout = runner.invoke(app, norm_args)
-    assert res_json_stdout.exit_code == 0
-    parsed = json.loads(res_json_stdout.stdout.strip())
-    assert "FFX" in parsed and "PREFACE" in parsed
-    assert 0.0 < parsed["PREFACE"] < 1.0
-
-    json_file = tmp_path / "pred.json"
+    # Unified `preface predict`: JSON file (0..1 floats) when --prefix provided
+    pred_prefix = tmp_path / "sample0_pred"
     res_json_file = runner.invoke(
         app,
         [
@@ -586,50 +811,22 @@ def test_end_to_end_pipeline_and_cli(tmp_path: Path) -> None:
             str(sample_bam),
             "--model",
             str(onnx_path),
-            "--json",
-            str(json_file),
-        ],
-    )
-    assert res_json_file.exit_code == 0
-    assert json_file.is_file()
-    assert json.loads(json_file.read_text(encoding="utf-8")) == parsed
-
-    # Test CLI train with --olm and auto-FFY estimation on unlabeled samplesheet
-    entries = load_samplesheet(samplesheet_path)
-    unlabeled_sheet = tmp_path / "unlabeled_train.yaml"
-    write_samplesheet(
-        [type(e)(id=e.id, filepath=e.filepath, sex=None, ff=None) for e in entries],
-        outfile=unlabeled_sheet,
-    )
-    outdir_olm = tmp_path / "out_olm"
-    res_train_olm = runner.invoke(
-        app,
-        [
-            "train",
-            "-s",
-            str(unlabeled_sheet),
-            "--outdir",
-            str(outdir_olm),
-            "--nfeat",
-            "3",
-            "--olm",
-            "--binsize",
-            "5000",
-            "--ffy-binsize",
-            "5000",
-            "--cpus",
-            "2",
+            "--prefix",
+            str(pred_prefix),
             "--device",
             "cpu",
         ],
     )
-    assert res_train_olm.exit_code == 0, res_train_olm.stdout
-    assert (outdir_olm / "model.onnx").is_file()
-    ffx_val, pref_val = run_predict(
-        sample_bam, outdir_olm / "model.onnx", device_name="cpu"
-    )
-    assert np.isfinite(ffx_val)
-    assert np.isfinite(pref_val)
+    assert res_json_file.exit_code == 0
+    json_file = tmp_path / "sample0_pred.json"
+    assert json_file.is_file()
+    parsed = json.loads(json_file.read_text(encoding="utf-8"))
+    assert parsed["sex"] == "M"
+    for key in ("FFY", "FFX", "PREFACE"):
+        assert key in parsed
+        assert isinstance(parsed[key], float)
+        assert 0.0 <= parsed[key] <= 1.0
+    assert np.isclose(parsed["FFY"], true_ffs[0], atol=0.02)
 
 
 def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
@@ -640,50 +837,25 @@ def test_logging_and_cli_loglevel(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Unsupported log level"):
         configure_logging("TRACE")
 
-    bam_path = tmp_path / "log_sample.bam"
-    refs = [("chr1", 10000), ("chrY", 10000)]
-    bin_reads = [
-        (0, 100, 30, 0, 200),
-        (0, 5100, 30, 0, 200),
-        (1, 200, 30, 0, 16),
-        (1, 5200, 30, 0, 16),
-    ]
-    _write_synthetic_bam_from_bin_counts(bam_path, refs, bin_reads)
-
+    example_sheet = (
+        Path(__file__).resolve().parents[1] / "examples" / "samplesheet.yaml"
+    )
     res_debug = runner.invoke(
         app,
         [
-            "ffy",
-            "--infile",
-            str(bam_path),
+            "lint",
+            str(example_sheet),
             "--loglevel",
             "DEBUG",
         ],
     )
     assert res_debug.exit_code == 0
-    assert "sex = M" in res_debug.stdout
-    assert "Single-sample FFY" in res_debug.output
-
-    res_root_err = runner.invoke(
-        app,
-        [
-            "--loglevel",
-            "ERROR",
-            "ffy",
-            "--infile",
-            str(bam_path),
-        ],
-    )
-    assert res_root_err.exit_code == 0
-    assert "sex = M" in res_root_err.stdout
-    assert "Single-sample FFY" not in res_root_err.output
 
     res_invalid = runner.invoke(
         app,
         [
-            "ffy",
-            "--infile",
-            str(bam_path),
+            "lint",
+            str(example_sheet),
             "--loglevel",
             "INVALID",
         ],
