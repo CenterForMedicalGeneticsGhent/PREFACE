@@ -8,7 +8,8 @@ on:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
+  actions: write
 
 jobs:
   package:
@@ -37,12 +38,6 @@ jobs:
         with:
           name: preface-python-wheel
           path: dist/*.whl
-
-      - name: Attach Python wheel to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v3.0.3
-        with:
-          files: dist/*.whl
 
   image:
     name: Build and publish Python image
@@ -86,3 +81,12 @@ jobs:
             docker tag "preface:${{ github.sha }}" "$tag"
             docker push "$tag"
           done
+
+      - name: Clean up artifacts
+        if: github.event_name != 'pull_request'
+        uses: geekyeggo/delete-artifact@v6
+        with:
+          name: |
+            preface-docker-image
+            preface-python-wheel
+          failOnError: false
