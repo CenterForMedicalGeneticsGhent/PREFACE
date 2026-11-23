@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
+import tomllib
 import zlib
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import torch
 import yaml
 from typer.testing import CliRunner
 
+from preface import __version__
 from preface.cli import app
 from preface.ffy import extract_sample_y_profile
 from preface.hardware import configure_hardware, get_onnx_providers, resolve_device
@@ -891,3 +893,18 @@ def test_parallel_load_samples(tmp_path: Path) -> None:
     assert ds_1.possible_features == ds_2.possible_features
     assert np.allclose(ds_1.training_frame, ds_2.training_frame)
     assert np.allclose(ds_1.x_ratios, ds_2.x_ratios)
+
+
+def test_version_matches_pyproject() -> None:
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    pyproject_version = pyproject["project"]["version"]
+    assert pyproject_version == "0.2.0"
+    assert __version__ == pyproject_version
+
+    res = runner.invoke(app, ["--version"])
+    assert res.exit_code == 0
+    assert res.stdout.strip() == __version__
